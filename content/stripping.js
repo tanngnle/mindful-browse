@@ -38,7 +38,12 @@ function getAvailableElements(hostname) {
 // ── Interstitial Overlay ────────────────────────────────
 // Full-screen overlay that appears before the page loads.
 // Shows a breathing animation + countdown timer.
-// After the delay, the overlay fades out and stripping CSS takes effect.
+// What happens when the countdown reaches 0 depends on the level:
+//   strip    → the overlay fades out and removes itself automatically
+//              ("3s breathing + hide distractions" — no click needed);
+//   friction → the "I still want to go" button ENABLES at 0:00 and
+//              remains the ONLY exit — the user must consciously
+//              confirm their intention ("15s delay + intention").
 // This implements the "mindful delay" flow from the product spec.
 
 const OVERLAY_STYLES = `
@@ -145,7 +150,10 @@ function getInterstitialDelaySeconds(site) {
 
 self.__mindfulBrowseStrippingInternals = { getInterstitialDelaySeconds };
 
-function createInterstitialOverlay(delaySeconds, targetDomain) {
+function createInterstitialOverlay(delaySeconds, targetDomain, autoProceed = false) {
+  // autoProceed (Strip level): at 0:00 the overlay dismisses itself via
+  // the same fade-out path the button uses. Friction passes false — the
+  // button enabling at 0:00 stays the only exit.
   // Inject styles
   const styleEl = document.createElement('style');
   styleEl.id = 'mindfulbrowse-overlay-styles';
@@ -172,6 +180,17 @@ function createInterstitialOverlay(delaySeconds, targetDomain) {
   const countdownEl = overlay.querySelector('.countdown');
   const btnProceed = overlay.querySelector('.btn-proceed');
 
+  // Shared exit path — fade out, then remove overlay + injected styles.
+  // Used by the proceed button AND by Strip's auto-dismiss at 0:00.
+  function dismissOverlay() {
+    stopOverlayCountdown();
+    overlay.classList.add('fade-out');
+    setTimeout(() => {
+      overlay.remove();
+      styleEl.remove();
+    }, 500);
+  }
+
   stopOverlayCountdown();
   overlayCountdownInterval = setInterval(() => {
     remaining--;
@@ -179,21 +198,21 @@ function createInterstitialOverlay(delaySeconds, targetDomain) {
       stopOverlayCountdown();
       countdownEl.textContent = '0:00';
       countdownEl.style.color = 'var(--work-color, #2ed573)';
-      btnProceed.disabled = false;
+      if (autoProceed) {
+        // Strip: continue automatically — no click required.
+        dismissOverlay();
+      } else {
+        // Friction: button enables but the user must click to proceed.
+        btnProceed.disabled = false;
+      }
     } else {
       countdownEl.textContent = `0:${remaining.toString().padStart(2, '0')}`;
     }
   }, 1000);
 
-  // Proceed button
-  btnProceed.addEventListener('click', () => {
-    stopOverlayCountdown();
-    overlay.classList.add('fade-out');
-    setTimeout(() => {
-      overlay.remove();
-      styleEl.remove();
-    }, 500);
-  });
+  // Proceed button (Friction's only exit; Strip dismisses before it
+  // can ever be enabled, but the handler stays for robustness).
+  btnProceed.addEventListener('click', dismissOverlay);
 }
 
 // ── Overlay once-per-URL guard ──────────────────────────
@@ -231,7 +250,14 @@ function showInterstitialIfNeeded(site) {
   // a fresh one — overlays must never stack across navigations.
   removeExistingOverlay();
   lastOverlayUrl = currentUrl;
-  createInterstitialOverlay(delaySeconds, window.location.hostname);
+  // Strip auto-continues when its 3s countdown ends; Friction needs an
+  // explicit click, so only Strip gets the auto-proceed flag.
+  const restrictionLevel = site?.restrictionLevel || "strip";
+  createInterstitialOverlay(
+    delaySeconds,
+    window.location.hostname,
+    restrictionLevel === "strip"
+  );
 }
 
 function removeExistingOverlay() {
