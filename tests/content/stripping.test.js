@@ -15,6 +15,8 @@
  *    script exposes on `self` for tests;
  *  - the once-per-URL guard: storage onChanged re-runs must NOT
  *    re-show the overlay for the same page;
+ *  - countdown completion: Strip auto-dismisses the overlay at 0:00
+ *    (no click); Friction persists at 0:00 until the button is clicked;
  *  - YouTube SPA navigation (yt-page-data-updated + URL change)
  *    re-applies the overlay with the correct delay;
  *  - master toggle off / site toggled off / block level → no overlay.
@@ -161,6 +163,48 @@ describe("content script — overlay display and once-per-URL guard (#24)", () =
     await loadStripping([
       { domain: "youtube.com", active: true, restrictionLevel: "block" },
     ]);
+    expect(overlays()).toBe(0);
+  });
+
+  it("strip overlay auto-dismisses at 0:00 without a button click", async () => {
+    await loadStripping([
+      { domain: "youtube.com", active: true, restrictionLevel: "strip" },
+    ]);
+    expect(overlays()).toBe(1);
+
+    // Run the 3s countdown out — the overlay must start fading WITHOUT
+    // any click (spec: "3s breathing overlay, THEN stripped page").
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(countdownText()).toBe("0:00");
+    const overlay = document.querySelector("#mindfulbrowse-overlay");
+    expect(overlay.classList.contains("fade-out")).toBe(true);
+
+    // After the 0.5s fade the overlay and its styles are removed.
+    await vi.advanceTimersByTimeAsync(500);
+    expect(overlays()).toBe(0);
+    expect(document.getElementById("mindfulbrowse-overlay-styles")).toBeNull();
+  });
+
+  it("friction overlay persists at 0:00 until the button is clicked", async () => {
+    await loadStripping([
+      { domain: "youtube.com", active: true, restrictionLevel: "friction", frictionDelay: 5 },
+    ]);
+    expect(overlays()).toBe(1);
+
+    // At 0:00 the overlay is still standing — only the button enables.
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(countdownText()).toBe("0:00");
+    expect(overlays()).toBe(1);
+    const btn = document.querySelector("#mindfulbrowse-overlay .btn-proceed");
+    expect(btn.disabled).toBe(false);
+
+    // Still there long after 0:00 — no auto-dismiss for Friction.
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(overlays()).toBe(1);
+
+    // The click is the only exit.
+    btn.click();
+    await vi.advanceTimersByTimeAsync(500);
     expect(overlays()).toBe(0);
   });
 
