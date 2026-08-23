@@ -1,0 +1,2873 @@
+diff --git a/background.js b/background.js
+index 2788c73..f8d0c4d 100644
+--- a/background.js
++++ b/background.js
+@@ -5,8 +5,8 @@
+     ═══════════════════════════════════════════════════════ */
+ 
+ import { matchSite } from "./lib/matcher.js";
+-import { getFrictionConfig } from "./lib/friction-rules.js";
+ import { BUILTIN_SITES } from "./lib/domain.js";
++import { migrateStorage, CURRENT_SCHEMA_VERSION } from "./lib/storage-migration.js";
+ 
+ // Default settings
+ const DEFAULTS = {
+@@ -18,6 +18,10 @@ const DEFAULTS = {
+     longBreak: 15,
+     roundsBeforeLong: 4,
+   },
++  schemaVersion: CURRENT_SCHEMA_VERSION,
++  focusSessionActive: false,
++  focusSessionEndsAt: null,
++  proLicense: null,
+ };
+ 
+ // ── Hot-Path Cache ──────────────────────────────────────
+@@ -32,20 +36,73 @@ const DEFAULTS = {
+ // wakes up — rather than only in onInstalled/onStartup. `ready`
+ // is awaited as a one-time fallback if a navigation arrives before
+ // the initial read completes.
+-let cache = { enabled: DEFAULTS.enabled, sites: DEFAULTS.sites };
++let cache = { enabled: DEFAULTS.enabled, sites: DEFAULTS.sites, focusSessionActive: false };
++// Last-seen Lock Down deadline (epoch ms). Kept alongside the cache so the
++// local onChanged handler can run the expiry check even when an event only
++// carries one of the two session keys.
++let cacheSessionEndsAt = null;
+ let hydrated = false;
+ 
++// A Lock Down deadline is valid only when it's a finite epoch-ms number
++// still in the future. Anything else (past, null, missing, malformed)
++// means an expired or corrupt session.
++function isValidSessionDeadline(endsAt, now) {
++  return typeof endsAt === "number" && Number.isFinite(endsAt) && endsAt > now;
++}
++
++// Clear an expired session by writing both keys back to storage.local —
++// the write fires onChanged, which keeps every listener-driven cache
++// (this worker's, the popup's panel) coherent with the same code path.
++function clearExpiredSession() {
++  return chrome.storage.local.set({ focusSessionActive: false, focusSessionEndsAt: null });
++}
++
+ const ready = (async () => {
+-  const data = await chrome.storage.sync.get(["enabled", "sites"]);
+-  if (data.enabled !== undefined) cache.enabled = data.enabled;
+-  if (data.sites !== undefined) cache.sites = data.sites;
++  const syncData = await chrome.storage.sync.get(["enabled", "sites"]);
++  const localData = await chrome.storage.local.get(["focusSessionActive", "focusSessionEndsAt"]);
++  if (syncData.enabled !== undefined) cache.enabled = syncData.enabled;
++  if (syncData.sites !== undefined) cache.sites = syncData.sites;
++  if (localData.focusSessionEndsAt !== undefined) {
++    cacheSessionEndsAt = localData.focusSessionEndsAt;
++  }
++  if (localData.focusSessionActive === true) {
++    if (isValidSessionDeadline(localData.focusSessionEndsAt, Date.now())) {
++      cache.focusSessionActive = true;
++    } else {
++      // Service worker woke after the session deadline passed (or the
++      // deadline is missing/corrupt) — expire it before any navigation
++      // can observe an active Lock Down.
++      cache.focusSessionActive = false;
++      cacheSessionEndsAt = null;
++      await clearExpiredSession();
++    }
++  } else if (localData.focusSessionActive !== undefined) {
++    cache.focusSessionActive = localData.focusSessionActive;
++  }
+   hydrated = true;
+ })();
+ 
+ chrome.storage.onChanged.addListener((changes, areaName) => {
+-  if (areaName !== "sync") return;
+-  if (changes.enabled) cache.enabled = changes.enabled.newValue;
+-  if (changes.sites) cache.sites = changes.sites.newValue;
++  if (areaName === "sync") {
++    if (changes.enabled) cache.enabled = changes.enabled.newValue;
++    if (changes.sites) cache.sites = changes.sites.newValue;
++  }
++  if (areaName === "local" && (changes.focusSessionActive || changes.focusSessionEndsAt)) {
++    if (changes.focusSessionEndsAt) {
++      cacheSessionEndsAt = changes.focusSessionEndsAt.newValue ?? null;
++    }
++    if (changes.focusSessionActive) {
++      cache.focusSessionActive = changes.focusSessionActive.newValue === true;
++    }
++    // Same expiry gate as hydration, applied the moment a session write
++    // lands. The clear-write's own onChanged echo flips the cache back
++    // off through this very branch (newValue false), so no loop.
++    if (cache.focusSessionActive && !isValidSessionDeadline(cacheSessionEndsAt, Date.now())) {
++      cache.focusSessionActive = false;
++      cacheSessionEndsAt = null;
++      clearExpiredSession();
++    }
++  }
+ });
+ 
+ /**
+@@ -60,8 +117,25 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
+  * are only added if not already present (by domain).
+  */
+ chrome.runtime.onInstalled.addListener(async () => {
+-  const data = await chrome.storage.sync.get(null);
++  let data = await chrome.storage.sync.get(null);
+   const toSet = {};
++
++  // ── Schema migration (v0 → v1) ──────────────────────
++  // Runs once per user: converts interventionMode/frictionLevel
++  // to restrictionLevel/frictionDelay and stamps schemaVersion.
++  if (data.schemaVersion === undefined) {
++    const migrated = migrateStorage(data);
++    // Write back every key that changed
++    for (const key of Object.keys(migrated)) {
++      if (JSON.stringify(migrated[key]) !== JSON.stringify(data[key])) {
++        toSet[key] = migrated[key];
++      }
++    }
++    // Refresh data so the DEFAULTS backfill below sees migrated values
++    data = { ...data, ...toSet };
++  }
++
++  // ── DEFAULTS backfill ───────────────────────────────
+   for (const key of Object.keys(DEFAULTS)) {
+     if (data[key] === undefined) toSet[key] = DEFAULTS[key];
+   }
+@@ -97,32 +171,31 @@ chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
+     const matchedSite = matchSite(details.url, cache.sites);
+     if (!matchedSite) return;
+ 
+-    // Determine intervention mode (strip vs block)
+-    const interventionMode = matchedSite.interventionMode || "strip";
+-
+-    // If in strip mode, don't redirect — let content script handle it
+-    if (interventionMode === "strip") {
++    // Check Lock Down mode (force block all matched sites)
++    if (cache.focusSessionActive) {
++      const lockedDownUrl = chrome.runtime.getURL("blocked/blocked.html");
++      const lockdownRedirectUrl = `${lockedDownUrl}?domain=${encodeURIComponent(matchedSite.domain)}`;
++      try {
++        await chrome.tabs.update(details.tabId, { url: lockdownRedirectUrl });
++      } catch (err) {
++        // Tab may have closed mid-navigation — nothing to redirect.
++      }
+       return;
+     }
+ 
+-    // Get friction level (default to 3 for backward compatibility)
+-    const frictionLevel = matchedSite.frictionLevel || 3;
+-    const frictionConfig = getFrictionConfig(frictionLevel);
+-
+-    let redirectUrl;
+-
+-    if (frictionConfig.type === "interstitial") {
+-      // Level 1: Breathing delay
+-      const breathingPageUrl = chrome.runtime.getURL("blocked/breathing.html");
+-      redirectUrl = `${breathingPageUrl}?domain=${encodeURIComponent(matchedSite.domain)}&delay=${frictionConfig.delaySeconds}`;
+-    } else {
+-      // Level 3: Hard block (redirect to Pomodoro timer)
+-      const blockedPageUrl = chrome.runtime.getURL("blocked/blocked.html");
+-      redirectUrl = `${blockedPageUrl}?domain=${encodeURIComponent(matchedSite.domain)}`;
++    // Read restriction level directly (strip/friction/block).
++    // Strip and friction are delivered by the content script overlay —
++    // background lets them fall through; only block redirects.
++    const restrictionLevel = matchedSite.restrictionLevel;
++    if (restrictionLevel === "strip" || restrictionLevel === "friction") {
++      return;
+     }
+ 
++    // Block mode: redirect to Pomodoro timer page
++    const blockedPageUrl = chrome.runtime.getURL("blocked/blocked.html");
++    const redirectUrl = `${blockedPageUrl}?domain=${encodeURIComponent(matchedSite.domain)}`;
++
+     try {
+-      // Use chrome.tabs.update to redirect
+       await chrome.tabs.update(details.tabId, { url: redirectUrl });
+     } catch (err) {
+       // Tab may have closed mid-navigation — nothing to redirect.
+diff --git a/blocked/blocked.js b/blocked/blocked.js
+index e4b2923..79b83f2 100644
+--- a/blocked/blocked.js
++++ b/blocked/blocked.js
+@@ -261,6 +261,7 @@ function tick() {
+   renderTime(remaining);
+ 
+   if (remaining <= 0) {
++    const completingPhase = timerState.phase; // capture before the transition
+     playNotificationSound();
+     pulseRing();
+     timerState = skip(timerState, settings, now);
+@@ -268,6 +269,22 @@ function tick() {
+     disarmHeartbeat();
+     applyPhaseUI();
+     saveState();
++    // Lock Down lifecycle (#25): a NATURALLY completed work phase ends the
++    // focus session. Manual skip (skipPhase) deliberately does NOT clear it.
++    if (completingPhase === "work") {
++      clearFocusSession();
++    }
++  }
++}
++
++// End the Lock Down session by writing both keys back to storage.local —
++// the write's onChanged echo is what flips the background override cache
++// and the popup's Lock Down panel back to idle.
++async function clearFocusSession() {
++  try {
++    await chrome.storage.local.set({ focusSessionActive: false, focusSessionEndsAt: null });
++  } catch {
++    // Not in extension context
+   }
+ }
+ 
+diff --git a/content/stripping.js b/content/stripping.js
+index 8b6e95f..f126f5a 100644
+--- a/content/stripping.js
++++ b/content/stripping.js
+@@ -35,6 +35,189 @@ function getAvailableElements(hostname) {
+   return null;
+ }
+ 
++// ── Interstitial Overlay ────────────────────────────────
++// Full-screen overlay that appears before the page loads.
++// Shows a breathing animation + countdown timer.
++// After the delay, the overlay fades out and stripping CSS takes effect.
++// This implements the "mindful delay" flow from the product spec.
++
++const OVERLAY_STYLES = `
++  #mindfulbrowse-overlay {
++    position: fixed;
++    top: 0;
++    left: 0;
++    right: 0;
++    bottom: 0;
++    background: var(--bg-dark, #08080f);
++    z-index: 2147483647;
++    display: flex;
++    flex-direction: column;
++    align-items: center;
++    justify-content: center;
++    font-family: var(--font-body, 'Inter', -apple-system, BlinkMacSystemFont, sans-serif);
++    color: var(--text-primary, #e8e8f0);
++    transition: opacity 0.5s ease;
++  }
++  #mindfulbrowse-overlay.fade-out {
++    opacity: 0;
++  }
++  #mindfulbrowse-overlay .breathing-ring {
++    width: 120px;
++    height: 120px;
++    border-radius: 50%;
++    border: 3px solid var(--work-color, #2ed573);
++    opacity: 0.4;
++    animation: mindfulbrowse-breathe 4s ease-in-out infinite;
++    margin-bottom: 32px;
++  }
++  @keyframes mindfulbrowse-breathe {
++    0%, 100% { transform: scale(0.9); opacity: 0.3; }
++    50% { transform: scale(1.15); opacity: 0.6; }
++  }
++  #mindfulbrowse-overlay .message {
++    text-align: center;
++    margin-bottom: 24px;
++  }
++  #mindfulbrowse-overlay .message h1 {
++    font-size: 18px;
++    font-weight: 600;
++    margin-bottom: 8px;
++  }
++  #mindfulbrowse-overlay .message p {
++    font-size: 13px;
++    color: var(--text-secondary, #8888aa);
++  }
++  #mindfulbrowse-overlay .message .domain {
++    color: var(--work-color, #2ed573);
++    font-weight: 600;
++  }
++  #mindfulbrowse-overlay .countdown {
++    font-family: var(--font-display, 'Orbitron', monospace);
++    font-size: 36px;
++    letter-spacing: 2px;
++    margin-bottom: 24px;
++  }
++  #mindfulbrowse-overlay .btn-proceed {
++    padding: 12px 32px;
++    border: none;
++    border-radius: 12px;
++    font-family: var(--font-body, 'Inter', sans-serif);
++    font-size: 14px;
++    font-weight: 600;
++    cursor: pointer;
++    transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
++  }
++  #mindfulbrowse-overlay .btn-proceed:disabled {
++    background: rgba(255, 255, 255, 0.04);
++    color: var(--text-muted, #555570);
++    cursor: not-allowed;
++  }
++  #mindfulbrowse-overlay .btn-proceed:not(:disabled) {
++    background: var(--work-color, #2ed573);
++    color: var(--bg-dark, #08080f);
++  }
++  #mindfulbrowse-overlay .btn-proceed:not(:disabled):hover {
++    background: #3ee883;
++    transform: scale(1.02);
++  }
++`;
++
++// ── Overlay Delay Decision ──────────────────────────────
++// Pure helper: how long the interstitial overlay should last
++// for a given site.
++//   strip   → fixed 3s
++//   friction→ site.frictionDelay, falling back to 15s
++//   block   → null (no overlay; background already redirected)
++// Exposed on `self` so tests can exercise the decision directly
++// (content scripts are self-contained — no ES imports).
++
++function getInterstitialDelaySeconds(site) {
++  const restrictionLevel = site?.restrictionLevel || "strip";
++  if (restrictionLevel === "block") return null;
++  if (restrictionLevel === "friction") return site.frictionDelay || 15;
++  return 3;
++}
++
++self.__mindfulBrowseStrippingInternals = { getInterstitialDelaySeconds };
++
++function createInterstitialOverlay(delaySeconds, targetDomain) {
++  // Inject styles
++  const styleEl = document.createElement('style');
++  styleEl.id = 'mindfulbrowse-overlay-styles';
++  styleEl.textContent = OVERLAY_STYLES;
++  document.head.appendChild(styleEl);
++
++  // Create overlay
++  const overlay = document.createElement('div');
++  overlay.id = 'mindfulbrowse-overlay';
++  overlay.innerHTML = `
++    <div class="breathing-ring"></div>
++    <div class="message">
++      <h1>Take a deep breath</h1>
++      <p>You're about to visit <span class="domain">${targetDomain}</span></p>
++    </div>
++    <div class="countdown">0:${delaySeconds.toString().padStart(2, '0')}</div>
++    <button class="btn-proceed" disabled>I still want to go</button>
++  `;
++
++  document.documentElement.appendChild(overlay);
++
++  // Countdown logic
++  let remaining = delaySeconds;
++  const countdownEl = overlay.querySelector('.countdown');
++  const btnProceed = overlay.querySelector('.btn-proceed');
++
++  const timer = setInterval(() => {
++    remaining--;
++    if (remaining <= 0) {
++      clearInterval(timer);
++      countdownEl.textContent = '0:00';
++      countdownEl.style.color = 'var(--work-color, #2ed573)';
++      btnProceed.disabled = false;
++    } else {
++      countdownEl.textContent = `0:${remaining.toString().padStart(2, '0')}`;
++    }
++  }, 1000);
++
++  // Proceed button
++  btnProceed.addEventListener('click', () => {
++    clearInterval(timer);
++    overlay.classList.add('fade-out');
++    setTimeout(() => {
++      overlay.remove();
++      styleEl.remove();
++    }, 500);
++  });
++}
++
++// ── Overlay once-per-URL guard ──────────────────────────
++// applyStrippingProfile() re-runs on every sync onChanged event and
++// on every YouTube SPA navigation (`yt-page-data-updated`). The overlay
++// must NOT reappear for the same page — track the URL it last showed
++// for. Same URL → skip. Changed URL (real SPA navigation) → re-apply
++// the overlay with the correct delay for the site's restriction level.
++let lastOverlayUrl = null;
++
++function showInterstitialIfNeeded(site) {
++  // Block is handled by the background redirect — no overlay.
++  const delaySeconds = getInterstitialDelaySeconds(site);
++  if (delaySeconds === null) return;
++
++  const currentUrl = window.location.href;
++  if (lastOverlayUrl === currentUrl) return;
++
++  lastOverlayUrl = currentUrl;
++  createInterstitialOverlay(delaySeconds, window.location.hostname);
++}
++
++function removeExistingOverlay() {
++  // Drop a visible overlay (and its styles) when protection is
++  // switched off for this page — master toggle or site toggle.
++  lastOverlayUrl = null;
++  document.getElementById("mindfulbrowse-overlay")?.remove();
++  document.getElementById("mindfulbrowse-overlay-styles")?.remove();
++}
++
+ // ── Attribute Helpers ───────────────────────────────────
+ // The CSS file uses html[data-fg-{element}="true"] gates.
+ // Setting an attribute instantly activates the corresponding
+@@ -74,9 +257,10 @@ async function applyStrippingProfile() {
+     const data = await chrome.storage.sync.get(["sites", "enabled"]);
+     const sites = data.sites || [];
+ 
+-    // Master toggle off — strip nothing
++    // Master toggle off — strip nothing, no overlay
+     if (data.enabled === false) {
+       clearAllStripAttributes();
++      removeExistingOverlay();
+       return;
+     }
+ 
+@@ -90,15 +274,20 @@ async function applyStrippingProfile() {
+       );
+     });
+ 
+-    // Site not in list or toggled off — strip nothing
++    // Site not in list or toggled off — strip nothing, no overlay
+     if (!site || site.active === false) {
+       clearAllStripAttributes();
++      removeExistingOverlay();
+       return;
+     }
+ 
+-    // Check intervention mode
+-    const interventionMode = site.interventionMode || "strip";
+-    if (interventionMode !== "strip") {
++    // Restriction level decides what this script does:
++    //   strip / friction → strip elements (friction shows the delay
++    //                      overlay first, then lands on the stripped page)
++    //   block            → nothing; background.js already redirected
++    //                      this tab to blocked.html
++    const restrictionLevel = site.restrictionLevel || "strip";
++    if (restrictionLevel === "block") {
+       clearAllStripAttributes();
+       return;
+     }
+@@ -114,6 +303,12 @@ async function applyStrippingProfile() {
+     // Get stripping profile (use stored profile or default: all enabled)
+     const profile = site?.strippingProfile || {};
+ 
++    // Show interstitial overlay BEFORE setting stripping attributes.
++    // The once-per-URL guard inside keeps it from reappearing when
++    // this function re-runs for the same page (storage onChanged,
++    // yt-page-data-updated); a real URL change re-applies it.
++    showInterstitialIfNeeded(site);
++
+     // Set attributes for each available element
+     availableElements.forEach((elementName) => {
+       // Default to enabled (true) if not explicitly set to false
+diff --git a/lib/domain.js b/lib/domain.js
+index 8086633..2aaa29a 100644
+--- a/lib/domain.js
++++ b/lib/domain.js
+@@ -55,7 +55,7 @@ export const BUILTIN_SITES = [
+     color: "#ff0000",
+     icon: "▶",
+     active: true,
+-    interventionMode: "strip",
++    restrictionLevel: "strip",
+   },
+   {
+     domain: "facebook.com",
+@@ -63,7 +63,7 @@ export const BUILTIN_SITES = [
+     color: "#1877f2",
+     icon: "f",
+     active: true,
+-    interventionMode: "strip",
++    restrictionLevel: "strip",
+   },
+ ];
+ 
+diff --git a/lib/storage-migration.js b/lib/storage-migration.js
+new file mode 100644
+index 0000000..28d96be
+--- /dev/null
++++ b/lib/storage-migration.js
+@@ -0,0 +1,80 @@
++/*  ═══════════════════════════════════════════════════════
++    MindfulBrowse — Storage Migration
++    One-way migration from the v0 schema (interventionMode,
++    frictionLevel) to v1 (restrictionLevel, frictionDelay).
++    Pure function — no chrome.* dependencies.
++    ═══════════════════════════════════════════════════════ */
++
++export const CURRENT_SCHEMA_VERSION = 1;
++
++// Maps old frictionLevel numbers to frictionDelay seconds
++const FRICTION_LEVEL_TO_DELAY = {
++  1: 5,
++  2: 30,
++};
++
++/**
++ * Migrate raw storage data from v0 → v1 schema.
++ *
++ * v0 → v1 changes:
++ *   Per-site:
++ *     interventionMode "strip"         → restrictionLevel "strip"
++ *     interventionMode "block" + fl 3  → restrictionLevel "block"
++ *     interventionMode "block" + fl 1/2 → restrictionLevel "friction" + frictionDelay
++ *     (missing interventionMode)       → restrictionLevel "strip"
++ *     frictionLevel, interventionMode  → deleted
++ *   Top-level:
++ *     + schemaVersion, focusSessionActive, focusSessionEndsAt, proLicense
++ *
++ * Idempotent: data already at CURRENT_SCHEMA_VERSION is returned
++ * as a shallow clone without modification.
++ *
++ * @param {object} data  Raw object from chrome.storage.sync.get(null)
++ * @returns {object}     Migrated copy (input is never mutated)
++ */
++export function migrateStorage(data) {
++  const result = { ...data };
++
++  // Already at current version → nothing to do
++  if (result.schemaVersion >= CURRENT_SCHEMA_VERSION) {
++    return result;
++  }
++
++  // ── Per-site migration ────────────────────────────────
++  if (Array.isArray(result.sites)) {
++    result.sites = result.sites.map((site) => {
++      // Already migrated this site (has restrictionLevel, no interventionMode)
++      if (site.restrictionLevel && !site.interventionMode) {
++        return site;
++      }
++
++      const migrated = { ...site };
++      const mode = site.interventionMode;
++
++      if (mode === "block") {
++        const fl = site.frictionLevel || 3;
++        if (fl === 3) {
++          migrated.restrictionLevel = "block";
++        } else {
++          migrated.restrictionLevel = "friction";
++          migrated.frictionDelay = FRICTION_LEVEL_TO_DELAY[fl] ?? 10;
++        }
++      } else {
++        // "strip" or undefined → default
++        migrated.restrictionLevel = "strip";
++      }
++
++      delete migrated.interventionMode;
++      delete migrated.frictionLevel;
++      return migrated;
++    });
++  }
++
++  // ── Top-level new keys ────────────────────────────────
++  result.schemaVersion = CURRENT_SCHEMA_VERSION;
++  if (result.focusSessionActive === undefined) result.focusSessionActive = false;
++  if (result.focusSessionEndsAt === undefined) result.focusSessionEndsAt = null;
++  if (result.proLicense === undefined) result.proLicense = null;
++
++  return result;
++}
+diff --git a/package-lock.json b/package-lock.json
+index 495b17c..495a61f 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -1,4 +1,4 @@
+-﻿{
++{
+   "name": "MindfulBrowse",
+   "version": "1.0.0",
+   "lockfileVersion": 3,
+diff --git a/popup/popup.css b/popup/popup.css
+index 083cf3f..20318da 100644
+--- a/popup/popup.css
++++ b/popup/popup.css
+@@ -301,6 +301,7 @@ body {
+ /* ── Site Card ────────────────────── */
+ .site-card {
+   display: flex;
++  flex-wrap: wrap;
+   align-items: center;
+   gap: 10px;
+   padding: 10px 12px;
+@@ -439,11 +440,365 @@ body {
+   flex-shrink: 0;
+ }
+ 
+-.btn-delete:hover {
++.btn-delete:hover:not(:disabled) {
+   background: rgba(255, 71, 87, 0.15);
+   color: var(--danger);
+ }
+ 
++/* ── Restriction Dropdown (Strip / Friction / Block) ── */
++/* Native <select> wrapped in .restriction-field, which hosts a
++   pure-CSS tooltip: :has() inspects the currently selected
++   <option> and injects the matching description via ::before
++   content on hover. No JavaScript involved (Chrome-only :has()). */
++.restriction-field {
++  position: relative;
++  flex-shrink: 0;
++}
++
++.restriction-select {
++  appearance: none;
++  -webkit-appearance: none;
++  padding: 5px 24px 5px 10px;
++  background: var(--bg-input);
++  border: 1px solid var(--border);
++  border-radius: var(--radius-sm);
++  color: var(--text-primary);
++  font-family: 'Inter', sans-serif;
++  font-size: 11px;
++  font-weight: 600;
++  letter-spacing: 0.3px;
++  cursor: pointer;
++  transition: border-color var(--transition), background var(--transition);
++}
++
++.restriction-select:hover:not(:disabled) {
++  background: var(--surface-hover);
++  border-color: var(--border-accent);
++}
++
++/* Custom chevron — the wrapper paints it over the native arrow. */
++.restriction-field::after {
++  content: '';
++  position: absolute;
++  top: 50%;
++  right: 9px;
++  width: 5px;
++  height: 5px;
++  border-right: 1.5px solid var(--text-secondary);
++  border-bottom: 1.5px solid var(--text-secondary);
++  transform: translateY(-70%) rotate(45deg);
++  pointer-events: none;
++}
++
++/* Tooltip bubble — hidden until the field is hovered (or keyboard-
++   focused); its text comes from the :has() rules below. Positioned
++   below the control so the scrollable sites list never clips it. */
++.restriction-tooltip {
++  position: absolute;
++  top: calc(100% + 8px);
++  left: 50%;
++  transform: translateX(-50%) translateY(-3px);
++  opacity: 0;
++  visibility: hidden;
++  pointer-events: none;
++  white-space: nowrap;
++  z-index: 30;
++  padding: 6px 10px;
++  background: var(--surface-hover);
++  border: 1px solid var(--hairline);
++  border-radius: var(--radius-sm);
++  color: var(--text-secondary);
++  font-size: var(--text-xs);
++  font-weight: 500;
++  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
++  transition: opacity var(--transition), transform var(--transition), visibility var(--transition);
++}
++
++/* Caret pointing up at the select. */
++.restriction-tooltip::after {
++  content: '';
++  position: absolute;
++  bottom: 100%;
++  left: 50%;
++  transform: translateX(-50%);
++  border: 5px solid transparent;
++  border-bottom-color: var(--surface-hover);
++}
++
++.restriction-field:hover .restriction-tooltip,
++.restriction-field:focus-within .restriction-tooltip {
++  opacity: 1;
++  visibility: visible;
++  transform: translateX(-50%) translateY(0);
++}
++
++/* A disabled select carries no tooltip — hovering the wrapper must
++   never resurrect it while the card is locked down (#26). */
++.restriction-field:has(.restriction-select:disabled) .restriction-tooltip {
++  display: none;
++}
++
++/* The actual tooltip copy — keyed off the selected option. */
++.restriction-field:has(.restriction-select option[value="strip"]:checked) .restriction-tooltip::before {
++  content: '3s breathing + hide distractions';
++}
++
++.restriction-field:has(.restriction-select option[value="friction"]:checked) .restriction-tooltip::before {
++  content: '15s delay + intention';
++}
++
++.restriction-field:has(.restriction-select option[value="block"]:checked) .restriction-tooltip::before {
++  content: 'Redirect to timer';
++}
++
++/* ── Friction delay note (fixed 15s) ── */
++.friction-delay-note {
++  flex-basis: 100%;
++  margin: -4px 0 0;
++  padding-left: 30px; /* align with the domain label */
++  font-size: var(--text-xs);
++  color: var(--text-muted);
++}
++
++/* ── Element-Level Toggles (stripping profile) ── */
++.element-toggles {
++  flex-basis: 100%;
++  display: flex;
++  flex-wrap: wrap;
++  gap: 4px 14px;
++  margin: -2px 0 0;
++  padding: 6px 0 0 30px; /* align with the domain label */
++  border-top: 1px solid var(--hairline-faint);
++}
++
++.element-toggle {
++  display: inline-flex;
++  align-items: center;
++  gap: 5px;
++  cursor: pointer;
++  font-size: var(--text-xs);
++  color: var(--text-secondary);
++  transition: color var(--transition);
++}
++
++.element-toggle:hover:not(:has(input:disabled)) {
++  color: var(--text-primary);
++}
++
++.element-toggle input {
++  width: 13px;
++  height: 13px;
++  accent-color: var(--accent);
++  cursor: pointer;
++}
++
++/* ── Lock Down Disabled Card State (#26) ─────────── */
++/* While a Lock Down session runs, every site card wears a lock badge
++   and its per-site controls go inert — the card itself stays visible
++   and calm, just visibly locked. The master toggle is unaffected. */
++.lockdown-badge {
++  display: inline-flex;
++  align-items: center;
++  gap: 4px;
++  padding: 2px 7px;
++  border: 1px solid var(--border-accent);
++  border-radius: 10px;
++  background: rgba(46, 213, 115, 0.08);
++  color: var(--accent-light);
++  flex-shrink: 0;
++  user-select: none;
++}
++
++.lockdown-badge-text {
++  font-size: 9px;
++  font-weight: 700;
++  letter-spacing: 0.6px;
++  text-transform: uppercase;
++  line-height: 1;
++}
++
++.site-card.lockdown .restriction-select,
++.site-card.lockdown .site-toggle .toggle-slider,
++.site-card.lockdown .element-toggle,
++.site-card.lockdown .btn-delete {
++  opacity: 0.5;
++}
++
++.site-card.lockdown .site-toggle,
++.site-card.lockdown .element-toggle,
++.site-card.lockdown .element-toggle input,
++.site-card.lockdown .restriction-select,
++.site-card.lockdown .btn-delete {
++  cursor: default;
++}
++
++/* ── Lock Down Panel (#25) ─────────────────────── */
++/* Collapsible session panel at the top of the Blocklist tab.
++   Collapsed it's a slim ~24px header row; expanded it reveals
++   either the idle picker (duration + Start) or the live session
++   (countdown + Stop). Uses the work-phase green as its accent —
++   a Lock Down session IS a focus commitment. */
++.lockdown-section {
++  padding: 8px 18px 0;
++}
++
++.lockdown-toggle {
++  display: flex;
++  align-items: center;
++  gap: 8px;
++  width: 100%;
++  min-height: 24px;
++  padding: 2px 0;
++  background: none;
++  border: none;
++  color: var(--text-secondary);
++  font-family: 'Inter', sans-serif;
++  font-size: 12px;
++  font-weight: 600;
++  letter-spacing: 0.4px;
++  cursor: pointer;
++  transition: color var(--transition);
++}
++
++.lockdown-toggle:hover {
++  color: var(--text-primary);
++}
++
++/* Small status dot — hollow neutral when idle, solid glowing
++   green while a session is running. */
++.lockdown-indicator {
++  width: 7px;
++  height: 7px;
++  border-radius: 50%;
++  border: 1.5px solid var(--text-muted);
++  background: transparent;
++  flex-shrink: 0;
++  transition: background var(--transition), border-color var(--transition), box-shadow var(--transition);
++}
++
++.lockdown-toggle.session-active .lockdown-indicator {
++  background: var(--accent);
++  border-color: var(--accent);
++  box-shadow: 0 0 6px var(--accent-glow);
++}
++
++.lockdown-title {
++  text-transform: uppercase;
++}
++
++/* Countdown chip in the header — visible even while collapsed,
++   so an active session is never invisible. */
++.lockdown-header-status {
++  font-size: 11px;
++  font-weight: 700;
++  font-variant-numeric: tabular-nums;
++  color: var(--accent-light);
++}
++
++.lockdown-toggle .chevron {
++  margin-left: auto;
++  transition: transform 0.3s cubic-bezier(0.4, 0, 0.2, 1);
++}
++
++.lockdown-toggle.open .chevron {
++  transform: rotate(180deg);
++}
++
++.lockdown-panel {
++  max-height: 0;
++  overflow: hidden;
++  transition: max-height 0.3s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.25s ease;
++  opacity: 0;
++}
++
++.lockdown-panel.open {
++  max-height: 80px;
++  opacity: 1;
++}
++
++.lockdown-idle,
++.lockdown-active {
++  display: flex;
++  align-items: center;
++  gap: 10px;
++  padding: 8px 0 4px;
++}
++
++.lockdown-duration {
++  appearance: none;
++  -webkit-appearance: none;
++  flex: 1;
++  padding: 6px 10px;
++  background: var(--bg-input);
++  border: 1px solid var(--border);
++  border-radius: var(--radius-sm);
++  color: var(--text-primary);
++  font-family: 'Inter', sans-serif;
++  font-size: 12px;
++  font-weight: 600;
++  cursor: pointer;
++  transition: border-color var(--transition), background var(--transition);
++}
++
++.lockdown-duration:hover {
++  background: var(--surface-hover);
++  border-color: var(--border-accent);
++}
++
++.lockdown-btn {
++  min-height: 30px;
++  padding: 0 16px;
++  border: none;
++  border-radius: var(--radius-sm);
++  font-family: 'Inter', sans-serif;
++  font-size: 12px;
++  font-weight: 700;
++  letter-spacing: 0.4px;
++  text-transform: uppercase;
++  cursor: pointer;
++  transition: background var(--transition), color var(--transition), border-color var(--transition), transform var(--transition);
++}
++
++.lockdown-btn:active {
++  transform: scale(0.96);
++}
++
++.lockdown-btn-start {
++  background: var(--accent);
++  color: white;
++}
++
++.lockdown-btn-start:hover {
++  background: var(--accent-light);
++}
++
++.lockdown-countdown {
++  font-family: var(--font-display);
++  font-size: 18px;
++  font-weight: 700;
++  font-variant-numeric: tabular-nums;
++  letter-spacing: 1px;
++  color: var(--accent-light);
++}
++
++.lockdown-note {
++  flex: 1;
++  font-size: 11px;
++  color: var(--text-secondary);
++}
++
++.lockdown-btn-stop {
++  background: transparent;
++  border: 1px solid var(--border);
++  color: var(--text-secondary);
++}
++
++.lockdown-btn-stop:hover {
++  border-color: var(--danger);
++  color: var(--danger);
++  background: rgba(255, 71, 87, 0.08);
++}
++
+ /* ── Settings Section ─────────────── */
+ .settings-section {
+   padding: 4px 18px 10px;
+@@ -749,13 +1104,15 @@ body {
+ .btn-add:focus-visible,
+ .btn-delete:focus-visible,
+ .settings-toggle:focus-visible,
++.lockdown-toggle:focus-visible,
++.lockdown-duration:focus-visible,
++.lockdown-btn:focus-visible,
+ .tab-btn:focus-visible,
+ .timer-btn:focus-visible,
+ .open-full-timer:focus-visible,
+ #site-input:focus-visible,
+ .slider:focus-visible,
+-.mode-button:focus-visible,
+-.friction-level-select:focus-visible,
++.restriction-select:focus-visible,
+ .element-toggle input:focus-visible,
+ .master-toggle input:focus-visible + .toggle-slider,
+ .site-toggle input:focus-visible + .toggle-slider {
+@@ -779,10 +1136,21 @@ body {
+   .toggle-slider::after,
+   .settings-panel,
+   .settings-toggle .chevron,
++  .lockdown-panel,
++  .lockdown-toggle .chevron,
++  .lockdown-indicator,
++  .lockdown-btn,
++  .lockdown-duration,
+   .btn-add,
+   .tab-btn,
+   .timer-btn,
+   .open-full-timer,
++  .restriction-select,
++  .restriction-tooltip,
++  .site-card.lockdown .restriction-select,
++  .site-card.lockdown .site-toggle .toggle-slider,
++  .site-card.lockdown .element-toggle,
++  .site-card.lockdown .btn-delete,
+   .slider::-webkit-slider-thumb {
+     transition: none !important;
+   }
+diff --git a/popup/popup.html b/popup/popup.html
+index db39298..30bd6b6 100644
+--- a/popup/popup.html
++++ b/popup/popup.html
+@@ -40,6 +40,37 @@
+     <!-- Blocklist tab panel -->
+     <div role="tabpanel" id="tab-panel-sites" aria-labelledby="tab-btn-sites">
+ 
++    <!-- Lock Down Panel (#25) — collapsible, collapsed by default -->
++    <section class="lockdown-section">
++      <button type="button" class="lockdown-toggle" id="lockdown-toggle" aria-expanded="false" aria-controls="lockdown-panel">
++        <span class="lockdown-indicator" id="lockdown-indicator" aria-hidden="true"></span>
++        <span class="lockdown-title">Lock Down</span>
++        <span class="lockdown-header-status" id="lockdown-header-status" hidden></span>
++        <svg class="chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true">
++          <polyline points="6 9 12 15 18 9"></polyline>
++        </svg>
++      </button>
++
++      <div class="lockdown-panel" id="lockdown-panel">
++        <!-- Idle state: pick a duration, start the session -->
++        <div class="lockdown-idle" id="lockdown-idle">
++          <select id="lockdown-duration" class="lockdown-duration" aria-label="Lock Down duration">
++            <option value="15">15 min</option>
++            <option value="25" selected>25 min</option>
++            <option value="45">45 min</option>
++            <option value="60">60 min</option>
++          </select>
++          <button type="button" class="lockdown-btn lockdown-btn-start" id="lockdown-start-btn" aria-label="Start Lock Down session">Start</button>
++        </div>
++        <!-- Active state: live countdown + stop -->
++        <div class="lockdown-active" id="lockdown-active" hidden>
++          <span class="lockdown-countdown" id="lockdown-countdown" aria-label="Lock Down time remaining">--:--</span>
++          <span class="lockdown-note">All sites &rarr; Block mode</span>
++          <button type="button" class="lockdown-btn lockdown-btn-stop" id="lockdown-stop-btn" aria-label="Stop Lock Down session">Stop</button>
++        </div>
++      </div>
++    </section>
++
+     <!-- Add Website Section -->
+     <section class="add-site-section">
+       <div class="input-group">
+diff --git a/popup/popup.js b/popup/popup.js
+index 159e085..3be670d 100644
+--- a/popup/popup.js
++++ b/popup/popup.js
+@@ -5,7 +5,6 @@
+ 
+ import { normalizeDomain, isValidDomain, isBuiltinSite, getBuiltinSite } from "../lib/domain.js";
+ import { getAvailableElements } from "../lib/stripping-rules.js";
+-import { getFrictionConfig } from "../lib/friction-rules.js";
+ import {
+   start,
+   pause,
+@@ -46,6 +45,27 @@ const tabBtnTimer = document.getElementById("tab-btn-timer");
+ const tabPanelSites = document.getElementById("tab-panel-sites");
+ const tabPanelTimer = document.getElementById("tab-panel-timer");
+ 
++// ── Lock Down Panel DOM (#25) ─────────────────────
++const lockdownToggle = document.getElementById("lockdown-toggle");
++const lockdownPanel = document.getElementById("lockdown-panel");
++const lockdownIdle = document.getElementById("lockdown-idle");
++const lockdownActive = document.getElementById("lockdown-active");
++const lockdownDurationSelect = document.getElementById("lockdown-duration");
++const lockdownStartBtn = document.getElementById("lockdown-start-btn");
++const lockdownStopBtn = document.getElementById("lockdown-stop-btn");
++const lockdownCountdown = document.getElementById("lockdown-countdown");
++const lockdownHeaderStatus = document.getElementById("lockdown-header-status");
++
++// Lock Down session state mirrors the focusSessionActive /
++// focusSessionEndsAt pair in chrome.storage.local. The panel NEVER reads
++// storage.sync copies of those keys (inert v1-migration leftovers) and
++// re-renders from local-area onChanged events, so external writers —
++// the background worker expiring a session, the blocked page clearing
++// one on natural work-phase completion — are reflected live.
++let lockdownSessionActive = false;
++let lockdownSessionEndsAt = null;
++let lockdownTickerHandle = null;
++
+ // ── Timer Tab DOM ───────────────────────────────────────
+ const popupFlipClockMount = document.getElementById("popup-flip-clock");
+ const popupTimerDigits = document.getElementById("popup-timer-digits");
+@@ -123,6 +143,17 @@ let hasStoredTimerState = false;
+ const PHASE_LABELS = { work: "WORK", shortBreak: "BREAK", longBreak: "LONG BREAK" };
+ const TAB_STORAGE_KEY = "MindfulBrowse_active_tab";
+ 
++// Friction mode has a single fixed delay (ticket #23) — no user-facing
++// delay picker anymore. Persisted alongside restrictionLevel: 'friction'.
++const FRICTION_DELAY_SECONDS = 15;
++
++// The three restriction levels, in dropdown order: [value, label].
++const RESTRICTION_LEVELS = [
++  ["strip", "Strip"],
++  ["friction", "Friction"],
++  ["block", "Block"],
++];
++
+ // ── Init ────────────────────────────────────────────────
+ async function init() {
+   const data = await chrome.storage.sync.get(null);
+@@ -154,6 +185,7 @@ async function init() {
+   // fixtures can't crash).
+   initTabs();
+   initTimerTab();
++  initLockDownPanel();
+ 
+   // Event listeners
+   addSiteBtn.addEventListener("click", () => queueSiteMutation(addSite));
+@@ -191,9 +223,10 @@ async function init() {
+   // immediately re-render on top of our own optimistic UI update.
+   chrome.storage.onChanged.addListener((changes, areaName) => {
+     // Local area carries the shared timer state (written by the blocked
+-    // page and by this popup's Timer tab).
++    // page and by this popup's Timer tab) and the Lock Down session keys.
+     if (areaName === "local") {
+       handleTimerStateChange(changes);
++      handleLockDownChange(changes);
+       return;
+     }
+     if (areaName !== "sync") return;
+@@ -478,6 +511,178 @@ function disarmPopupTicker() {
+   }
+ }
+ 
++// ── Lock Down Panel (#25) ─────────────────────────
++// Session lifecycle: START writes focusSessionActive/focusSessionEndsAt
++// to chrome.storage.local; STOP removes both keys. All rendering flows
++// through renderLockDown(), driven by the initial read, our own writes'
++// onChanged echoes, and external writes (background expiry, blocked-page
++// natural completion) alike — no suppression flag needed because every
++// render is idempotent over the same two values.
++async function initLockDownPanel() {
++  if (!lockdownToggle) return;
++
++  lockdownToggle.addEventListener("click", () => {
++    const isOpen = lockdownToggle.classList.toggle("open");
++    lockdownPanel.classList.toggle("open", isOpen);
++    lockdownToggle.setAttribute("aria-expanded", String(isOpen));
++  });
++
++  lockdownStartBtn?.addEventListener("click", startLockDownSession);
++  lockdownStopBtn?.addEventListener("click", stopLockDownSession);
++
++  // Popup open — adopt whatever the session keys currently hold.
++  try {
++    const data = await chrome.storage.local.get(["focusSessionActive", "focusSessionEndsAt"]);
++    lockdownSessionActive = data.focusSessionActive === true;
++    lockdownSessionEndsAt =
++      typeof data.focusSessionEndsAt === "number" ? data.focusSessionEndsAt : null;
++  } catch {
++    // Not in extension context.
++  }
++  renderLockDown();
++
++  // Popup closing — stop the countdown ticker.
++  window.addEventListener("pagehide", disarmLockDownTicker);
++}
++
++async function startLockDownSession() {
++  const minutes = parseInt(lockdownDurationSelect?.value ?? "25", 10);
++  try {
++    await chrome.storage.local.set({
++      focusSessionActive: true,
++      focusSessionEndsAt: Date.now() + minutes * 60000,
++    });
++  } catch {
++    // Storage unavailable — the panel stays idle.
++  }
++}
++
++async function stopLockDownSession() {
++  try {
++    await chrome.storage.local.remove(["focusSessionActive", "focusSessionEndsAt"]);
++  } catch {
++    // Storage unavailable — nothing more to do.
++  }
++}
++
++// chrome.storage.onChanged (local area) handler for the session keys.
++// Removal events arrive with newValue undefined and flip the panel back
++// to idle just like an explicit { false, null } write.
++function handleLockDownChange(changes) {
++  if (!lockdownToggle) return;
++  if (!changes.focusSessionActive && !changes.focusSessionEndsAt) return;
++
++  if (changes.focusSessionActive) {
++    lockdownSessionActive = changes.focusSessionActive.newValue === true;
++  }
++  if (changes.focusSessionEndsAt) {
++    const value = changes.focusSessionEndsAt.newValue;
++    lockdownSessionEndsAt = typeof value === "number" ? value : null;
++  }
++  renderLockDown();
++}
++
++function renderLockDown() {
++  if (!lockdownToggle) return;
++
++  lockdownIdle.hidden = lockdownSessionActive;
++  lockdownActive.hidden = !lockdownSessionActive;
++  lockdownToggle.classList.toggle("session-active", lockdownSessionActive);
++
++  if (lockdownSessionActive) {
++    paintLockDownCountdown();
++    armLockDownTicker();
++  } else {
++    disarmLockDownTicker();
++    if (lockdownHeaderStatus) lockdownHeaderStatus.hidden = true;
++  }
++
++  // Ticket #26 — the card list mirrors the session state: every card
++  // gains a lock badge and inert controls while active, and becomes
++  // fully interactive again the moment the session ends. This runs on
++  // every render path (initial read, our own writes, external clears),
++  // so card states always follow the session without a popup reload.
++  applyLockDownStateToCards();
++}
++
++// ── Lock Down Card State (#26) ──────────────────────
++// Purely visual/reactive — enforcement is the background worker's job.
++// While a session is active every site card (built-in and user-added)
++// shows a lock badge and its per-site controls are inert. The MASTER
++// toggle is deliberately NOT touched — the extension can always be
++// disabled, even mid-session.
++function buildLockBadge() {
++  const badge = document.createElement("span");
++  badge.className = "lockdown-badge";
++  badge.innerHTML = `
++    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
++      <rect x="3" y="11" width="18" height="11" rx="2"></rect>
++      <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
++    </svg>
++    <span class="lockdown-badge-text">Lock Down</span>
++  `;
++  return badge;
++}
++
++function applyLockDownStateToCard(card) {
++  card.classList.toggle("lockdown", lockdownSessionActive);
++
++  card.querySelectorAll(".restriction-select").forEach((select) => {
++    select.disabled = lockdownSessionActive;
++  });
++  card.querySelectorAll(".site-toggle input, .element-toggle input").forEach((checkbox) => {
++    checkbox.disabled = lockdownSessionActive;
++  });
++  card.querySelectorAll(".btn-delete").forEach((btn) => {
++    btn.disabled = lockdownSessionActive;
++  });
++
++  const badge = card.querySelector(".lockdown-badge");
++  if (lockdownSessionActive && !badge) {
++    card.insertBefore(buildLockBadge(), card.querySelector(".site-domain"));
++  } else if (!lockdownSessionActive && badge) {
++    badge.remove();
++  }
++}
++
++function applyLockDownStateToCards() {
++  if (!sitesList) return;
++  sitesList.querySelectorAll(".site-card").forEach(applyLockDownStateToCard);
++}
++
++// Deadline-based countdown — recomputed from focusSessionEndsAt on every
++// paint, so the 1s interval is only a repaint trigger, never the clock.
++function lockdownRemainingSeconds() {
++  if (typeof lockdownSessionEndsAt !== "number") return 0;
++  return Math.max(0, Math.ceil((lockdownSessionEndsAt - Date.now()) / 1000));
++}
++
++function paintLockDownCountdown() {
++  const display = formatTime(lockdownRemainingSeconds());
++  if (lockdownCountdown) {
++    lockdownCountdown.textContent = display;
++    // aria-label (not aria-live) keeps screen readers informed without
++    // announcing every second.
++    lockdownCountdown.setAttribute("aria-label", `Lock Down time remaining: ${display}`);
++  }
++  if (lockdownHeaderStatus) {
++    lockdownHeaderStatus.hidden = false;
++    lockdownHeaderStatus.textContent = display;
++  }
++}
++
++function armLockDownTicker() {
++  disarmLockDownTicker();
++  lockdownTickerHandle = setInterval(paintLockDownCountdown, 1000);
++}
++
++function disarmLockDownTicker() {
++  if (lockdownTickerHandle != null) {
++    clearInterval(lockdownTickerHandle);
++    lockdownTickerHandle = null;
++  }
++}
++
+ // ── Debounce Helper ─────────────────────────────────────
+ function debounce(fn, wait) {
+   let timeoutId;
+@@ -677,64 +882,58 @@ function buildSiteCard(site) {
+     </svg>
+   `;
+ 
+-  // ── Intervention Mode Toggle ──────────────────────────
+-  // Strip (default) vs Block. Shown as a clickable button
+-  // that cycles between modes.
+-  const interventionMode = site.interventionMode || "strip";
+-  const modeToggle = document.createElement("div");
+-  modeToggle.className = "intervention-mode-toggle";
+-  const modeButton = document.createElement("button");
+-  modeButton.className = "mode-button";
+-  modeButton.title = `Current mode: ${interventionMode}. Click to toggle.`;
+-  modeButton.setAttribute("aria-label", `Intervention mode for ${site.domain}`);
+-  const modeValue = document.createElement("span");
+-  modeValue.className = "mode-value";
+-  modeValue.textContent = interventionMode;
+-  modeButton.appendChild(modeValue);
+-  modeToggle.appendChild(modeButton);
++  // ── Restriction Level Dropdown ────────────────────────
++  // Strip / Friction / Block in a native <select>. The .restriction-field
++  // wrapper hosts a pure-CSS tooltip (popup.css) that describes the
++  // currently selected level on hover — no JavaScript involved.
++  const restrictionLevel = site.restrictionLevel || "strip";
++  const restrictionField = document.createElement("div");
++  restrictionField.className = "restriction-field";
++
++  const restrictionSelect = document.createElement("select");
++  restrictionSelect.className = "restriction-select";
++  restrictionSelect.setAttribute("aria-label", `Restriction level for ${site.domain}`);
++  RESTRICTION_LEVELS.forEach(([value, label]) => {
++    const option = document.createElement("option");
++    option.value = value;
++    option.textContent = label;
++    restrictionSelect.appendChild(option);
++  });
++  restrictionSelect.value = restrictionLevel;
++
++  // Empty span — its text is injected by CSS (::before content keyed off
++  // :has(option:checked)), so it carries no accessible name of its own.
++  const tooltip = document.createElement("span");
++  tooltip.className = "restriction-tooltip";
++  tooltip.setAttribute("aria-hidden", "true");
++
++  restrictionField.appendChild(restrictionSelect);
++  restrictionField.appendChild(tooltip);
+ 
+   card.appendChild(favicon);
+   card.appendChild(domainLabel);
+   card.appendChild(toggleLabel);
+-  card.appendChild(modeToggle);
++  card.appendChild(restrictionField);
+   // Built-in sites cannot be deleted — skip the delete button
+   if (!builtin) {
+     card.appendChild(deleteBtn);
+   }
+ 
+-  // ─ Friction Level Selector ───────────────────────────
+-  // Only shown when in block mode. Levels 1, 2, 3.
+-  if (interventionMode === "block") {
+-    const frictionLevel = site.frictionLevel || 3;
+-    const frictionSelect = document.createElement("select");
+-    frictionSelect.className = "friction-level-select";
+-    frictionSelect.setAttribute("aria-label", `Friction level for ${site.domain}`);
+-
+-    [1, 2, 3].forEach((level) => {
+-      const option = document.createElement("option");
+-      option.value = level;
+-      option.textContent = `Level ${level}: ${getFrictionConfig(level).description}`;
+-      option.selected = level === frictionLevel;
+-      frictionSelect.appendChild(option);
+-    });
+-
+-    frictionSelect.addEventListener("change", () => {
+-      // Capture the chosen value at event time: the queued mutation must
+-      // apply exactly the user action that enqueued it, never whatever the
+-      // (possibly re-rendered or replaced) control shows by the time the
+-      // mutation actually runs.
+-      const level = parseInt(frictionSelect.value);
+-      queueSiteMutation(() => setFrictionLevel(site.domain, level));
+-    });
+-
+-    card.appendChild(frictionSelect);
++  // ─ Friction Delay Note ────────────────────────────────
++  // Friction delay is fixed at 15s (ticket #23) — static text only,
++  // no selector. Only shown while in friction mode.
++  if (restrictionLevel === "friction") {
++    const delayNote = document.createElement("p");
++    delayNote.className = "friction-delay-note";
++    delayNote.textContent = `Delay: ${FRICTION_DELAY_SECONDS} seconds`;
++    card.appendChild(delayNote);
+   }
+ 
+   // ── Element-Level Toggles (Stripping Profile) ─────────
+   // Only shown for supported platforms (YouTube, Facebook)
+   // when in strip mode.
+   const availableElements = getAvailableElements(site.domain);
+-  if (availableElements && interventionMode === "strip") {
++  if (availableElements && restrictionLevel === "strip") {
+     const elementToggles = document.createElement("div");
+     elementToggles.className = "element-toggles";
+     const profile = site.strippingProfile || {};
+@@ -758,7 +957,7 @@ function buildSiteCard(site) {
+       elementToggles.appendChild(label);
+ 
+       checkbox.addEventListener("change", () => {
+-        const enabled = checkbox.checked; // eager capture — see frictionSelect above
++        const enabled = checkbox.checked; // eager capture — see restrictionSelect below
+         queueSiteMutation(() => toggleElement(site.domain, elementName, enabled));
+       });
+     });
+@@ -778,10 +977,13 @@ function buildSiteCard(site) {
+     queueSiteMutation(() => toggleSite(site.domain, active));
+   });
+ 
+-  // Intervention mode handler — cycles between strip and block
+-  modeButton.addEventListener("click", () =>
+-    queueSiteMutation(() => toggleInterventionMode(site.domain, interventionMode))
+-  );
++  // Restriction level handler — the chosen level is captured eagerly at
++  // event time (same rationale as the site toggle above) and persisted
++  // through the mutation queue.
++  restrictionSelect.addEventListener("change", () => {
++    const level = restrictionSelect.value;
++    queueSiteMutation(() => setRestrictionLevel(site.domain, level));
++  });
+ 
+   // Delete handler — keyed by domain, not index (see removeSite), and
+   // queued (see queueSiteMutation) so two rapid deletes can't race.
+@@ -790,6 +992,11 @@ function buildSiteCard(site) {
+     setTimeout(() => queueSiteMutation(() => removeSite(site.domain)), 250);
+   });
+ 
++  // Lock Down card state (#26) — applied at build time so cards created
++  // mid-session are locked immediately; applyLockDownStateToCards() keeps
++  // already-rendered cards in step when the session flips later.
++  applyLockDownStateToCard(card);
++
+   return card;
+ }
+ 
+@@ -844,15 +1051,22 @@ async function removeSite(domain) {
+   renderSites(sites);
+ }
+ 
+-// ── Toggle Intervention Mode ────────────────────────────
+-// Cycles between 'strip' and 'block' modes for a site.
+-async function toggleInterventionMode(domain, currentMode) {
++// ── Set Restriction Level ───────────────────────────────
++// Persists the dropdown's chosen level for a site. Friction carries the
++// fixed 15s delay; every other level drops frictionDelay so no stale
++// value lingers in storage.
++async function setRestrictionLevel(domain, level) {
+   const data = await chrome.storage.sync.get(["sites"]);
+   const sites = data.sites || [];
+   const site = sites.find((s) => s.domain === domain);
+   if (!site) return;
+ 
+-  site.interventionMode = currentMode === "strip" ? "block" : "strip";
++  site.restrictionLevel = level;
++  if (level === "friction") {
++    site.frictionDelay = FRICTION_DELAY_SECONDS;
++  } else {
++    delete site.frictionDelay;
++  }
+   suppressNextSitesChange = true;
+   const ok = await setStorage({ sites });
+   if (!ok) {
+@@ -884,22 +1098,6 @@ async function toggleElement(domain, elementName, enabled) {
+   }
+ }
+ 
+-// ─ Set Friction Level ──────────────────────────────────
+-// Updates the friction level for a site (1, 2, or 3).
+-async function setFrictionLevel(domain, level) {
+-  const data = await chrome.storage.sync.get(["sites"]);
+-  const sites = data.sites || [];
+-  const site = sites.find((s) => s.domain === domain);
+-  if (!site) return;
+-
+-  site.frictionLevel = level;
+-  suppressNextSitesChange = true;
+-  const ok = await setStorage({ sites });
+-  if (!ok) {
+-    suppressNextSitesChange = false;
+-  }
+-}
+-
+ // ── CSS Escape (for attribute selectors) ────────────────
+ function cssEscape(str) {
+   return window.CSS && CSS.escape ? CSS.escape(str) : str.replace(/["\\]/g, "\\$&");
+diff --git a/tests/background.test.js b/tests/background.test.js
+index 8ac8299..5719f0b 100644
+--- a/tests/background.test.js
++++ b/tests/background.test.js
+@@ -6,6 +6,7 @@ import {
+   FAKE_EXTENSION_ID,
+ } from "./helpers/chrome-mock.js";
+ import { BUILTIN_SITES } from "../lib/domain.js";
++import { CURRENT_SCHEMA_VERSION } from "../lib/storage-migration.js";
+ 
+ // background.js hydrates its cache from chrome.storage at module top level
+ // (an IIFE), so the mock must be installed and the module (re)imported fresh
+@@ -15,9 +16,12 @@ async function loadBackground() {
+   vi.resetModules();
+   const mod = await import("../background.js");
+   // Let the top-level hydration IIFE's microtasks settle so `hydrated` flips
+-  // true before the test starts firing navigations.
+-  await Promise.resolve();
+-  await Promise.resolve();
++  // true before the test starts firing navigations. Sized generously: the
++  // session-expiry path (#25) awaits an extra storage.local.set after the
++  // two storage.get reads, and over-flushing settled promises is harmless.
++  for (let i = 0; i < 12; i++) {
++    await Promise.resolve();
++  }
+   return mod;
+ }
+ 
+@@ -29,7 +33,7 @@ describe("background.js — navigation blocking", () => {
+   it("redirects a blocked-domain navigation to blocked.html with the matched domain", async () => {
+     await chrome.storage.sync.set({
+       enabled: true,
+-      sites: [{ domain: "reddit.com", active: true, interventionMode: "block" }],
++      sites: [{ domain: "reddit.com", active: true, restrictionLevel: "block" }],
+     });
+     await loadBackground();
+ 
+@@ -47,7 +51,7 @@ describe("background.js — navigation blocking", () => {
+   it("the redirect URL contains no dead url= parameter", async () => {
+     await chrome.storage.sync.set({
+       enabled: true,
+-      sites: [{ domain: "reddit.com", active: true, interventionMode: "block" }],
++      sites: [{ domain: "reddit.com", active: true, restrictionLevel: "block" }],
+     });
+     await loadBackground();
+ 
+@@ -140,7 +144,7 @@ describe("background.js — cache coherence via storage.onChanged", () => {
+ 
+     // Write new sites via storage.set — the onChanged listener should update
+     // the in-memory cache synchronously, no further get() needed.
+-    await chrome.storage.sync.set({ sites: [{ domain: "reddit.com", active: true, interventionMode: "block" }] });
++    await chrome.storage.sync.set({ sites: [{ domain: "reddit.com", active: true, restrictionLevel: "block" }] });
+ 
+     // No additional storage.get calls should have happened as a result of
+     // that write or the cache update.
+@@ -182,6 +186,257 @@ describe("background.js — cache coherence via storage.onChanged", () => {
+   });
+ });
+ 
++describe("background.js — restrictionLevel routing (#24)", () => {
++  beforeEach(() => {
++    resetChromeMock();
++  });
++
++  it("strip level does NOT redirect — the content script overlay handles it", async () => {
++    await chrome.storage.sync.set({
++      enabled: true,
++      sites: [{ domain: "youtube.com", active: true, restrictionLevel: "strip" }],
++    });
++    await loadBackground();
++
++    await triggerNavigation({ url: "https://www.youtube.com/", tabId: 3 });
++
++    expect(chrome.tabs.update).not.toHaveBeenCalled();
++  });
++
++  it("friction level does NOT redirect — the content script overlay handles it (no breathing.html redirect)", async () => {
++    await chrome.storage.sync.set({
++      enabled: true,
++      sites: [{ domain: "youtube.com", active: true, restrictionLevel: "friction", frictionDelay: 20 }],
++    });
++    await loadBackground();
++
++    await triggerNavigation({ url: "https://www.youtube.com/watch?v=x", tabId: 3 });
++
++    expect(chrome.tabs.update).not.toHaveBeenCalled();
++  });
++
++  it("block level redirects to blocked.html with the matched domain", async () => {
++    await chrome.storage.sync.set({
++      enabled: true,
++      sites: [{ domain: "youtube.com", active: true, restrictionLevel: "block" }],
++    });
++    await loadBackground();
++
++    await triggerNavigation({ url: "https://www.youtube.com/", tabId: 5 });
++
++    expect(chrome.tabs.update).toHaveBeenCalledTimes(1);
++    const [tabId, updateProps] = chrome.tabs.update.mock.calls[0];
++    expect(tabId).toBe(5);
++    expect(updateProps.url).toContain(
++      `chrome-extension://${FAKE_EXTENSION_ID}/blocked/blocked.html`
++    );
++    expect(updateProps.url).toContain("domain=youtube.com");
++  });
++});
++
++describe("background.js — Lock Down override (#25 pre-wiring)", () => {
++  beforeEach(() => {
++    resetChromeMock();
++  });
++
++  it("focusSessionActive=true redirects a strip site to blocked.html", async () => {
++    await chrome.storage.sync.set({
++      enabled: true,
++      sites: [{ domain: "youtube.com", active: true, restrictionLevel: "strip" }],
++    });
++    await chrome.storage.local.set({
++      focusSessionActive: true,
++      focusSessionEndsAt: Date.now() + 10 * 60000,
++    });
++    await loadBackground();
++
++    await triggerNavigation({ url: "https://www.youtube.com/", tabId: 4 });
++
++    expect(chrome.tabs.update).toHaveBeenCalledTimes(1);
++    const [, updateProps] = chrome.tabs.update.mock.calls[0];
++    expect(updateProps.url).toContain(
++      `chrome-extension://${FAKE_EXTENSION_ID}/blocked/blocked.html`
++    );
++    expect(updateProps.url).toContain("domain=youtube.com");
++  });
++
++  it("focusSessionActive=true redirects a friction site to blocked.html", async () => {
++    await chrome.storage.sync.set({
++      enabled: true,
++      sites: [{ domain: "youtube.com", active: true, restrictionLevel: "friction", frictionDelay: 10 }],
++    });
++    await chrome.storage.local.set({
++      focusSessionActive: true,
++      focusSessionEndsAt: Date.now() + 10 * 60000,
++    });
++    await loadBackground();
++
++    await triggerNavigation({ url: "https://www.youtube.com/", tabId: 4 });
++
++    expect(chrome.tabs.update).toHaveBeenCalledTimes(1);
++    const [, updateProps] = chrome.tabs.update.mock.calls[0];
++    expect(updateProps.url).toContain("blocked/blocked.html");
++    expect(updateProps.url).toContain("domain=youtube.com");
++  });
++
++  it("picks up focusSessionActive flips in the local area via onChanged", async () => {
++    await chrome.storage.sync.set({
++      enabled: true,
++      sites: [{ domain: "youtube.com", active: true, restrictionLevel: "strip" }],
++    });
++    await loadBackground();
++
++    // Session not active yet: strip falls through, no redirect.
++    await triggerNavigation({ url: "https://www.youtube.com/", tabId: 4 });
++    expect(chrome.tabs.update).not.toHaveBeenCalled();
++    // Lock Down starts — written to chrome.storage.local with a valid
++    // (future) deadline; an expired/missing deadline would be cleared by
++    // the onChanged expiry gate instead of arming the override.
++    await chrome.storage.local.set({
++      focusSessionActive: true,
++      focusSessionEndsAt: Date.now() + 10 * 60000,
++    });
++
++    await triggerNavigation({ url: "https://www.youtube.com/", tabId: 4 });
++    expect(chrome.tabs.update).toHaveBeenCalledTimes(1);
++    const [, updateProps] = chrome.tabs.update.mock.calls[0];
++    expect(updateProps.url).toContain("blocked/blocked.html");
++
++    // Session ends — strip sites fall through again.
++    await chrome.storage.local.set({ focusSessionActive: false });
++
++    await triggerNavigation({ url: "https://www.youtube.com/", tabId: 4 });
++    expect(chrome.tabs.update).toHaveBeenCalledTimes(1); // unchanged
++  });
++});
++
++describe("background.js — Lock Down session expiry (#25)", () => {
++  beforeEach(() => {
++    resetChromeMock();
++  });
++
++  it("hydration clears an active session whose deadline already passed", async () => {
++    await chrome.storage.sync.set({
++      enabled: true,
++      sites: [{ domain: "youtube.com", active: true, restrictionLevel: "strip" }],
++    });
++    await chrome.storage.local.set({
++      focusSessionActive: true,
++      focusSessionEndsAt: Date.now() - 60000, // expired while the worker slept
++    });
++    await loadBackground();
++
++    // Both keys are rewritten to storage.local (which also drives the
++    // cache via onChanged).
++    const local = await chrome.storage.local.get(["focusSessionActive", "focusSessionEndsAt"]);
++    expect(local.focusSessionActive).toBe(false);
++    expect(local.focusSessionEndsAt).toBe(null);
++
++    // Cache is off: the strip site falls through instead of redirecting.
++    await triggerNavigation({ url: "https://www.youtube.com/", tabId: 4 });
++    expect(chrome.tabs.update).not.toHaveBeenCalled();
++  });
++
++  it("hydration clears an active session with a missing/invalid deadline", async () => {
++    // Active flag but no deadline at all.
++    await chrome.storage.local.set({ focusSessionActive: true });
++    await loadBackground();
++
++    let local = await chrome.storage.local.get(["focusSessionActive", "focusSessionEndsAt"]);
++    expect(local.focusSessionActive).toBe(false);
++    expect(local.focusSessionEndsAt).toBe(null);
++  });
++
++  it("hydration clears an active session with a non-numeric deadline", async () => {
++    await chrome.storage.local.set({
++      focusSessionActive: true,
++      focusSessionEndsAt: "soon",
++    });
++    await loadBackground();
++
++    const local = await chrome.storage.local.get(["focusSessionActive", "focusSessionEndsAt"]);
++    expect(local.focusSessionActive).toBe(false);
++    expect(local.focusSessionEndsAt).toBe(null);
++  });
++
++  it("hydration preserves a non-expired session and keeps the override armed", async () => {
++    await chrome.storage.sync.set({
++      enabled: true,
++      sites: [{ domain: "youtube.com", active: true, restrictionLevel: "strip" }],
++    });
++    const endsAt = Date.now() + 20 * 60000;
++    await chrome.storage.local.set({ focusSessionActive: true, focusSessionEndsAt: endsAt });
++    await loadBackground();
++
++    // Session untouched.
++    const local = await chrome.storage.local.get(["focusSessionActive", "focusSessionEndsAt"]);
++    expect(local.focusSessionActive).toBe(true);
++    expect(local.focusSessionEndsAt).toBe(endsAt);
++
++    // Override still redirects.
++    await triggerNavigation({ url: "https://www.youtube.com/", tabId: 4 });
++    expect(chrome.tabs.update).toHaveBeenCalledTimes(1);
++    const [, updateProps] = chrome.tabs.update.mock.calls[0];
++    expect(updateProps.url).toContain("blocked/blocked.html");
++  });
++
++  it("onChanged expires a session whose write lands with a past deadline", async () => {
++    await chrome.storage.sync.set({
++      enabled: true,
++      sites: [{ domain: "youtube.com", active: true, restrictionLevel: "strip" }],
++    });
++    await loadBackground();
++
++    // A write that arms the flag with an already-past deadline (corrupt
++    // writer, clock skew) — the listener must neutralize it immediately.
++    await chrome.storage.local.set({
++      focusSessionActive: true,
++      focusSessionEndsAt: Date.now() - 1000,
++    });
++    for (let i = 0; i < 12; i++) await Promise.resolve();
++
++    const local = await chrome.storage.local.get(["focusSessionActive", "focusSessionEndsAt"]);
++    expect(local.focusSessionActive).toBe(false);
++    expect(local.focusSessionEndsAt).toBe(null);
++
++    await triggerNavigation({ url: "https://www.youtube.com/", tabId: 4 });
++    expect(chrome.tabs.update).not.toHaveBeenCalled();
++  });
++
++  it("onChanged expires a session when the deadline is written alone in the past", async () => {
++    await chrome.storage.sync.set({
++      enabled: true,
++      sites: [{ domain: "youtube.com", active: true, restrictionLevel: "strip" }],
++    });
++    // Flag armed first with a valid deadline...
++    await chrome.storage.local.set({
++      focusSessionActive: true,
++      focusSessionEndsAt: Date.now() + 10 * 60000,
++    });
++    await loadBackground();
++
++    // ...then the deadline gets rewritten into the past by itself.
++    await chrome.storage.local.set({ focusSessionEndsAt: Date.now() - 1000 });
++    for (let i = 0; i < 12; i++) await Promise.resolve();
++
++    const local = await chrome.storage.local.get(["focusSessionActive", "focusSessionEndsAt"]);
++    expect(local.focusSessionActive).toBe(false);
++    expect(local.focusSessionEndsAt).toBe(null);
++
++    await triggerNavigation({ url: "https://www.youtube.com/", tabId: 4 });
++    expect(chrome.tabs.update).not.toHaveBeenCalled();
++  });
++
++  it("hydration leaves an inactive session's stored keys alone", async () => {
++    await chrome.storage.local.set({ focusSessionActive: false, focusSessionEndsAt: null });
++    const setCallsBefore = chrome.storage.local.set.mock.calls.length;
++    await loadBackground();
++
++    // No expiry rewrite happened during hydration.
++    expect(chrome.storage.local.set.mock.calls.length).toBe(setCallsBefore);
++  });
++});
++
+ describe("background.js — onInstalled seeding (A2 regression)", () => {
+   beforeEach(() => {
+     resetChromeMock();
+@@ -201,14 +456,18 @@ describe("background.js — onInstalled seeding (A2 regression)", () => {
+       longBreak: 15,
+       roundsBeforeLong: 4,
+     });
++    expect(data.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
++    expect(data.focusSessionActive).toBe(false);
++    expect(data.focusSessionEndsAt).toBe(null);
++    expect(data.proLicense).toBe(null);
+   });
+ 
+   it("does NOT clobber an existing non-empty `sites` array on update", async () => {
+     const existingSites = [
+-      { domain: "reddit.com", active: true },
+-      { domain: "twitter.com", active: false },
++      { domain: "reddit.com", active: true, restrictionLevel: "strip" },
++      { domain: "twitter.com", active: false, restrictionLevel: "strip" },
+     ];
+-    await chrome.storage.sync.set({ sites: existingSites, enabled: false });
++    await chrome.storage.sync.set({ sites: existingSites, enabled: false, schemaVersion: CURRENT_SCHEMA_VERSION });
+     await loadBackground();
+ 
+     await triggerOnInstalled({ reason: "update" });
+@@ -221,14 +480,14 @@ describe("background.js — onInstalled seeding (A2 regression)", () => {
+ 
+   it("backfills only genuinely missing default keys, leaving present ones untouched", async () => {
+     // Only `sites` is present; `enabled` and `pomodoroSettings` are missing.
+-    await chrome.storage.sync.set({ sites: [{ domain: "example.com", active: true }] });
++    await chrome.storage.sync.set({ sites: [{ domain: "example.com", active: true, restrictionLevel: "strip" }] });
+     await loadBackground();
+ 
+     await triggerOnInstalled({ reason: "install" });
+ 
+     const data = await chrome.storage.sync.get(null);
+     // Built-in sites are appended since they weren't present
+-    expect(data.sites).toEqual([{ domain: "example.com", active: true }, ...BUILTIN_SITES]);
++    expect(data.sites).toEqual([{ domain: "example.com", active: true, restrictionLevel: "strip" }, ...BUILTIN_SITES]);
+     expect(data.enabled).toBe(true); // backfilled
+     expect(data.pomodoroSettings).toEqual({
+       workDuration: 25,
+@@ -243,6 +502,10 @@ describe("background.js — onInstalled seeding (A2 regression)", () => {
+       enabled: true,
+       sites: [...BUILTIN_SITES],
+       pomodoroSettings: { workDuration: 25, shortBreak: 5, longBreak: 15, roundsBeforeLong: 4 },
++      schemaVersion: CURRENT_SCHEMA_VERSION,
++      focusSessionActive: false,
++      focusSessionEndsAt: null,
++      proLicense: null,
+     });
+     await loadBackground();
+ 
+diff --git a/tests/blocked/blocked.test.js b/tests/blocked/blocked.test.js
+index 2d497e0..fdccefd 100644
+--- a/tests/blocked/blocked.test.js
++++ b/tests/blocked/blocked.test.js
+@@ -187,6 +187,123 @@ describe("blocked page — shared timer state: external writes (ADR-0002)", () =
+   });
+ });
+ 
++describe("blocked page — Lock Down session lifecycle (#25)", () => {
++  afterEach(() => {
++    vi.useRealTimers();
++    document.body.innerHTML = "";
++  });
++
++  it("natural work-phase completion clears focusSessionActive/focusSessionEndsAt from storage.local", async () => {
++    vi.useFakeTimers();
++    const now = Date.now();
++    // Seed a RUNNING work phase 2s away from natural completion, plus an
++    // armed Lock Down session.
++    await mountBlocked({
++      focusSessionActive: true,
++      focusSessionEndsAt: now + 60 * 60000,
++      MindfulBrowse_timer_state: {
++        phase: "work",
++        currentRound: 1,
++        totalRounds: 4,
++        totalTime: 1500,
++        isRunning: true,
++        endsAt: now + 2000,
++        remaining: null,
++        savedAt: now,
++      },
++    });
++
++    expect(document.getElementById("timer-digits").textContent).toBe("00:02");
++
++    await vi.advanceTimersByTimeAsync(2100);
++    await flushMicrotasks();
++
++    // The phase advanced to the short break...
++    expect(document.getElementById("phase-text").textContent).toBe("Short Break");
++    // ...and the Lock Down session was cleared.
++    const data = await chrome.storage.local.get(["focusSessionActive", "focusSessionEndsAt"]);
++    expect(data.focusSessionActive).toBe(false);
++    expect(data.focusSessionEndsAt).toBe(null);
++  });
++
++  it("manual skip of the work phase does NOT clear the focus session", async () => {
++    const endsAt = Date.now() + 60 * 60000;
++    await mountBlocked({ focusSessionActive: true, focusSessionEndsAt: endsAt });
++
++    vi.useFakeTimers();
++    document.getElementById("btn-skip").click();
++    await flushMicrotasks();
++
++    // The phase advanced (skip worked)...
++    expect(document.getElementById("phase-text").textContent).toBe("Short Break");
++    // ...but the session is untouched.
++    const data = await chrome.storage.local.get(["focusSessionActive", "focusSessionEndsAt"]);
++    expect(data.focusSessionActive).toBe(true);
++    expect(data.focusSessionEndsAt).toBe(endsAt);
++  });
++
++  it("natural break-phase completion does NOT clear the focus session (work-only rule)", async () => {
++    vi.useFakeTimers();
++    const now = Date.now();
++    const endsAt = now + 60 * 60000;
++    // Seed a PAUSED short break with 2s left; starting it and letting it
++    // complete naturally must not touch the session keys.
++    await mountBlocked({
++      focusSessionActive: true,
++      focusSessionEndsAt: endsAt,
++      MindfulBrowse_timer_state: {
++        phase: "shortBreak",
++        currentRound: 2,
++        totalRounds: 4,
++        totalTime: 300,
++        isRunning: false,
++        endsAt: null,
++        remaining: 2,
++        savedAt: now,
++      },
++    });
++
++    expect(document.getElementById("phase-text").textContent).toBe("Short Break");
++    document.getElementById("btn-start").click();
++    await flushMicrotasks();
++    await vi.advanceTimersByTimeAsync(2100);
++    await flushMicrotasks();
++
++    // Back in the next work round...
++    expect(document.getElementById("phase-text").textContent).toBe("Focus Time");
++    // ...and the session is untouched.
++    const data = await chrome.storage.local.get(["focusSessionActive", "focusSessionEndsAt"]);
++    expect(data.focusSessionActive).toBe(true);
++    expect(data.focusSessionEndsAt).toBe(endsAt);
++  });
++
++  it("natural work-phase completion does not fail when no session keys exist", async () => {
++    vi.useFakeTimers();
++    const now = Date.now();
++    await mountBlocked({
++      MindfulBrowse_timer_state: {
++        phase: "work",
++        currentRound: 1,
++        totalRounds: 4,
++        totalTime: 1500,
++        isRunning: true,
++        endsAt: now + 2000,
++        remaining: null,
++        savedAt: now,
++      },
++    });
++
++    await vi.advanceTimersByTimeAsync(2100);
++    await flushMicrotasks();
++
++    expect(document.getElementById("phase-text").textContent).toBe("Short Break");
++    // The clear-write still lands harmlessly as the canonical idle values.
++    const data = await chrome.storage.local.get(["focusSessionActive", "focusSessionEndsAt"]);
++    expect(data.focusSessionActive).toBe(false);
++    expect(data.focusSessionEndsAt).toBe(null);
++  });
++});
++
+ describe("blocked page — flip clock", () => {
+   beforeEach(async () => {
+     await mountBlocked();
+diff --git a/tests/content/stripping.test.js b/tests/content/stripping.test.js
+new file mode 100644
+index 0000000..d5df880
+--- /dev/null
++++ b/tests/content/stripping.test.js
+@@ -0,0 +1,201 @@
++// @vitest-environment-options {"url": "https://www.youtube.com/watch?v=abc123"}
++/**
++ * stripping.test.js — tests for the declarative content script
++ * (content/stripping.js), ticket #24.
++ *
++ * Follows the tests/blocked pattern for non-module page scripts: the
++ * real script is dynamically imported (executing its top-level wiring)
++ * against the installed chrome mock and jsdom. The jsdom URL above is
++ * set to a YouTube page so the script's domain matching, overlay path,
++ * and platform detection all engage.
++ *
++ * Covers:
++ *  - the overlay delay decision (strip = 3s fixed, friction =
++ *    frictionDelay || 15, block = no overlay) via the pure helper the
++ *    script exposes on `self` for tests;
++ *  - the once-per-URL guard: storage onChanged re-runs must NOT
++ *    re-show the overlay for the same page;
++ *  - YouTube SPA navigation (yt-page-data-updated + URL change)
++ *    re-applies the overlay with the correct delay;
++ *  - master toggle off / site toggled off / block level → no overlay.
++ */
++import { describe, it, expect, beforeEach, afterEach, beforeAll, vi } from "vitest";
++import { resetChromeMock } from "../helpers/chrome-mock.js";
++import { flushMicrotasks } from "../helpers/dom-fixture.js";
++
++const overlays = () => document.querySelectorAll("#mindfulbrowse-overlay").length;
++const countdownText = () =>
++  document.querySelector("#mindfulbrowse-overlay .countdown")?.textContent;
++
++// Track listeners the content script adds to `window` so afterEach can
++// detach them — otherwise every fresh module import accumulates another
++// `yt-page-data-updated` handler that keeps firing in later tests.
++const trackedWindowListeners = [];
++const originalAddEventListener = window.addEventListener.bind(window);
++const originalRemoveEventListener = window.removeEventListener.bind(window);
++
++beforeAll(() => {
++  window.addEventListener = (type, fn, opts) => {
++    trackedWindowListeners.push([type, fn, opts]);
++    return originalAddEventListener(type, fn, opts);
++  };
++});
++
++beforeEach(() => {
++  resetChromeMock();
++  vi.useFakeTimers();
++});
++
++afterEach(() => {
++  vi.clearAllTimers();
++  vi.useRealTimers();
++  // Detach every window listener registered during the test.
++  while (trackedWindowListeners.length > 0) {
++    const [type, fn, opts] = trackedWindowListeners.pop();
++    originalRemoveEventListener(type, fn, opts);
++  }
++  // Drop any overlay remnants so the next test starts clean.
++  document
++    .querySelectorAll("#mindfulbrowse-overlay, #mindfulbrowse-overlay-styles")
++    .forEach((el) => el.remove());
++});
++
++/**
++ * Fresh chrome mock + storage, then a fresh import of the content
++ * script (its top level runs applyStrippingProfile() and registers
++ * listeners). Fake timers are armed by beforeEach before this runs.
++ */
++async function loadStripping(sites, { enabled = true } = {}) {
++  await chrome.storage.sync.set({ enabled, sites });
++  vi.resetModules();
++  await import("../../content/stripping.js");
++  await flushMicrotasks();
++}
++
++describe("content script — overlay delay decision (#24)", () => {
++  let getInterstitialDelaySeconds;
++
++  beforeAll(async () => {
++    // Import with empty storage so the top-level apply run is a no-op;
++    // we only need the exposed pure helper here.
++    resetChromeMock();
++    vi.resetModules();
++    await import("../../content/stripping.js");
++    getInterstitialDelaySeconds =
++      self.__mindfulBrowseStrippingInternals.getInterstitialDelaySeconds;
++  });
++
++  it("strip selects a fixed 3s delay", () => {
++    expect(getInterstitialDelaySeconds({ restrictionLevel: "strip" })).toBe(3);
++  });
++
++  it("strip ignores frictionDelay — always 3s", () => {
++    expect(
++      getInterstitialDelaySeconds({ restrictionLevel: "strip", frictionDelay: 45 })
++    ).toBe(3);
++  });
++
++  it("friction selects frictionDelay when present", () => {
++    expect(
++      getInterstitialDelaySeconds({ restrictionLevel: "friction", frictionDelay: 20 })
++    ).toBe(20);
++  });
++
++  it("friction falls back to 15s when frictionDelay is missing", () => {
++    expect(getInterstitialDelaySeconds({ restrictionLevel: "friction" })).toBe(15);
++  });
++
++  it("block selects no overlay (null)", () => {
++    expect(getInterstitialDelaySeconds({ restrictionLevel: "block" })).toBeNull();
++  });
++
++  it("a legacy site without restrictionLevel is treated as strip (3s)", () => {
++    expect(getInterstitialDelaySeconds({ domain: "youtube.com" })).toBe(3);
++  });
++});
++
++describe("content script — overlay display and once-per-URL guard (#24)", () => {
++  it("strip shows the overlay once with a 3s countdown", async () => {
++    await loadStripping([
++      { domain: "youtube.com", active: true, restrictionLevel: "strip" },
++    ]);
++
++    expect(overlays()).toBe(1);
++    expect(countdownText()).toBe("0:03");
++  });
++
++  it("friction shows the overlay with frictionDelay (or 15s default)", async () => {
++    await loadStripping([
++      { domain: "youtube.com", active: true, restrictionLevel: "friction", frictionDelay: 8 },
++    ]);
++    expect(overlays()).toBe(1);
++    expect(countdownText()).toBe("0:08");
++
++    // Clean slate, then the 15s default.
++    document.querySelectorAll("#mindfulbrowse-overlay, #mindfulbrowse-overlay-styles")
++      .forEach((el) => el.remove());
++    await loadStripping([
++      { domain: "youtube.com", active: true, restrictionLevel: "friction" },
++    ]);
++    expect(overlays()).toBe(1);
++    expect(countdownText()).toBe("0:15");
++  });
++
++  it("block shows no overlay (background already redirected)", async () => {
++    await loadStripping([
++      { domain: "youtube.com", active: true, restrictionLevel: "block" },
++    ]);
++    expect(overlays()).toBe(0);
++  });
++
++  it("does not re-show the overlay when applyStrippingProfile re-runs for the same URL", async () => {
++    await loadStripping([
++      { domain: "youtube.com", active: true, restrictionLevel: "strip" },
++    ]);
++    expect(overlays()).toBe(1);
++
++    // A popup write re-triggers applyStrippingProfile via sync onChanged.
++    await chrome.storage.sync.set({
++      sites: [{ domain: "youtube.com", active: true, restrictionLevel: "strip" }],
++    });
++    await flushMicrotasks();
++    expect(overlays()).toBe(1);
++
++    // A YouTube SPA event WITHOUT a URL change must not re-show either.
++    window.dispatchEvent(new Event("yt-page-data-updated"));
++    await vi.advanceTimersByTimeAsync(100);
++    await flushMicrotasks();
++    expect(overlays()).toBe(1);
++  });
++
++  it("re-applies the overlay when a YouTube SPA navigation changes the URL", async () => {
++    await loadStripping([
++      { domain: "youtube.com", active: true, restrictionLevel: "strip" },
++    ]);
++    expect(overlays()).toBe(1);
++
++    // SPA navigation: URL actually changed, then yt-page-data-updated fires.
++    history.pushState({}, "", "/watch?v=def456");
++    window.dispatchEvent(new Event("yt-page-data-updated"));
++    await vi.advanceTimersByTimeAsync(100);
++    await flushMicrotasks();
++
++    expect(overlays()).toBe(2); // new overlay for the new page
++    expect(countdownText()).toBe("0:03");
++  });
++
++  it("shows no overlay when the master toggle is off", async () => {
++    await loadStripping(
++      [{ domain: "youtube.com", active: true, restrictionLevel: "strip" }],
++      { enabled: false }
++    );
++    expect(overlays()).toBe(0);
++  });
++
++  it("shows no overlay when the site is toggled off", async () => {
++    await loadStripping([
++      { domain: "youtube.com", active: false, restrictionLevel: "strip" },
++    ]);
++    expect(overlays()).toBe(0);
++  });
++});
+diff --git a/tests/lib/storage-migration.test.js b/tests/lib/storage-migration.test.js
+new file mode 100644
+index 0000000..8b0d43a
+--- /dev/null
++++ b/tests/lib/storage-migration.test.js
+@@ -0,0 +1,141 @@
++import { describe, it, expect } from "vitest";
++import { migrateStorage, CURRENT_SCHEMA_VERSION } from "../../lib/storage-migration.js";
++
++describe("migrateStorage", () => {
++  // ── Slice 1: Fresh install (empty storage) ──────────────
++  it("adds schemaVersion and new top-level keys to empty data", () => {
++    const result = migrateStorage({});
++    expect(result.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
++    expect(result.focusSessionActive).toBe(false);
++    expect(result.focusSessionEndsAt).toBe(null);
++    expect(result.proLicense).toBe(null);
++  });
++
++  // ── Slice 2: Already migrated ───────────────────────────
++  it("returns already-migrated data unchanged", () => {
++    const data = {
++      schemaVersion: 1,
++      focusSessionActive: false,
++      focusSessionEndsAt: null,
++      sites: [{ domain: "youtube.com", active: true, restrictionLevel: "strip" }],
++    };
++    const result = migrateStorage(data);
++    expect(result).toEqual(data);
++  });
++
++  // ── Slice 3: strip migration ────────────────────────────
++  it('converts interventionMode "strip" to restrictionLevel "strip"', () => {
++    const data = {
++      sites: [{ domain: "youtube.com", active: true, interventionMode: "strip" }],
++    };
++    const result = migrateStorage(data);
++    expect(result.sites[0].restrictionLevel).toBe("strip");
++    expect(result.sites[0].interventionMode).toBeUndefined();
++  });
++
++  // ── Slice 4: block with frictionLevel 3 ─────────────────
++  it('converts interventionMode "block" + frictionLevel 3 to restrictionLevel "block"', () => {
++    const data = {
++      sites: [{
++        domain: "reddit.com",
++        active: true,
++        interventionMode: "block",
++        frictionLevel: 3,
++      }],
++    };
++    const result = migrateStorage(data);
++    expect(result.sites[0].restrictionLevel).toBe("block");
++    expect(result.sites[0].interventionMode).toBeUndefined();
++    expect(result.sites[0].frictionLevel).toBeUndefined();
++  });
++
++  // ── Slice 5: block with frictionLevel 1 → friction ──────
++  it('converts interventionMode "block" + frictionLevel 1 to restrictionLevel "friction" with delay', () => {
++    const data = {
++      sites: [{
++        domain: "twitter.com",
++        active: true,
++        interventionMode: "block",
++        frictionLevel: 1,
++      }],
++    };
++    const result = migrateStorage(data);
++    expect(result.sites[0].restrictionLevel).toBe("friction");
++    expect(result.sites[0].frictionDelay).toBe(5);
++    expect(result.sites[0].interventionMode).toBeUndefined();
++    expect(result.sites[0].frictionLevel).toBeUndefined();
++  });
++
++  // ── Slice 6: block with frictionLevel 2 → friction ──────
++  it('converts interventionMode "block" + frictionLevel 2 to restrictionLevel "friction" with delay', () => {
++    const data = {
++      sites: [{
++        domain: "twitter.com",
++        active: true,
++        interventionMode: "block",
++        frictionLevel: 2,
++      }],
++    };
++    const result = migrateStorage(data);
++    expect(result.sites[0].restrictionLevel).toBe("friction");
++    expect(result.sites[0].frictionDelay).toBe(30);
++  });
++
++  // ── Slice 7: missing interventionMode defaults to strip ──
++  it("defaults to restrictionLevel strip when interventionMode is missing", () => {
++    const data = {
++      sites: [{ domain: "example.com", active: true }],
++    };
++    const result = migrateStorage(data);
++    expect(result.sites[0].restrictionLevel).toBe("strip");
++  });
++
++  // ── Slice 8: preserves existing site fields ─────────────
++  it("preserves strippingProfile and other existing site fields", () => {
++    const data = {
++      sites: [{
++        domain: "youtube.com",
++        active: true,
++        interventionMode: "strip",
++        strippingProfile: { hideShorts: true, hideComments: true },
++        label: "YouTube",
++      }],
++    };
++    const result = migrateStorage(data);
++    expect(result.sites[0].strippingProfile).toEqual({ hideShorts: true, hideComments: true });
++    expect(result.sites[0].label).toBe("YouTube");
++  });
++
++  // ── Slice 9: mixed sites ────────────────────────────────
++  it("handles a mix of old and new format sites", () => {
++    const data = {
++      sites: [
++        { domain: "youtube.com", active: true, interventionMode: "strip" },
++        { domain: "reddit.com", active: true, restrictionLevel: "block" },
++        { domain: "twitter.com", active: true, interventionMode: "block", frictionLevel: 1 },
++      ],
++    };
++    const result = migrateStorage(data);
++    expect(result.sites[0].restrictionLevel).toBe("strip");
++    expect(result.sites[1].restrictionLevel).toBe("block");
++    expect(result.sites[2].restrictionLevel).toBe("friction");
++    expect(result.sites[2].frictionDelay).toBe(5);
++  });
++
++  // ── Slice 10: no sites key ──────────────────────────────
++  it("handles data with no sites key", () => {
++    const result = migrateStorage({ enabled: true });
++    expect(result.schemaVersion).toBe(CURRENT_SCHEMA_VERSION);
++    expect(result.sites).toBeUndefined();
++  });
++
++  // ── Slice 11: does not mutate input ─────────────────────
++  it("does not mutate the input data", () => {
++    const data = {
++      sites: [{ domain: "youtube.com", active: true, interventionMode: "strip" }],
++    };
++    const inputSnapshot = JSON.parse(JSON.stringify(data));
++    migrateStorage(data);
++    expect(data).toEqual(inputSnapshot);
++  });
++});
+diff --git a/tests/popup/popup.test.js b/tests/popup/popup.test.js
+index 6c08da4..1564de4 100644
+--- a/tests/popup/popup.test.js
++++ b/tests/popup/popup.test.js
+@@ -236,99 +236,157 @@ describe("popup.js — C3: rapid-succession delete keyed by domain", () => {
+   });
+ });
+ 
+-describe("popup.js — intervention mode", () => {
++describe("popup.js — restriction dropdown", () => {
+   afterEach(() => {
+     vi.useRealTimers();
+   });
+ 
+-  it("renders strip/block toggle for each site card", async () => {
++  /** Fires a change event on a card's restriction select and returns
++   *  the freshly persisted site object for that domain. */
++  async function selectLevel(domain, level) {
++    const select = document.querySelector(
++      `.site-card[data-domain="${domain}"] .restriction-select`
++    );
++    select.value = level;
++    select.dispatchEvent(new Event("change", { bubbles: true }));
++    await flushMicrotasks();
++    const data = await chrome.storage.sync.get(["sites"]);
++    return data.sites.find((s) => s.domain === domain);
++  }
++
++  it("renders a select with exactly Strip/Friction/Block options reflecting the stored restrictionLevel (built-ins and user sites)", async () => {
+     await mountPopup({
+       enabled: true,
+       sites: [
+-        { domain: "youtube.com", active: true, interventionMode: "strip" },
+-        { domain: "twitter.com", active: true, interventionMode: "block" },
++        { domain: "youtube.com", active: true, restrictionLevel: "strip" },
++        { domain: "facebook.com", active: true, restrictionLevel: "friction" },
++        { domain: "twitter.com", active: true, restrictionLevel: "block" },
+       ],
+     });
+ 
+-    const youtubeCard = document.querySelector('.site-card[data-domain="youtube.com"]');
+-    const twitterCard = document.querySelector('.site-card[data-domain="twitter.com"]');
+-
+-    // Each card should have an intervention mode toggle
+-    const youtubeModeToggle = youtubeCard.querySelector('.intervention-mode-toggle');
+-    const twitterModeToggle = twitterCard.querySelector('.intervention-mode-toggle');
+-
+-    expect(youtubeModeToggle).toBeTruthy();
+-    expect(twitterModeToggle).toBeTruthy();
+-
+-    // YouTube should show "strip" as selected
+-    const youtubeModeValue = youtubeModeToggle.querySelector('.mode-value');
+-    expect(youtubeModeValue.textContent).toBe("strip");
++    const expected = [
++      ["youtube.com", "strip"],
++      ["facebook.com", "friction"],
++      ["twitter.com", "block"],
++    ];
++    for (const [domain, level] of expected) {
++      const select = document.querySelector(
++        `.site-card[data-domain="${domain}"] .restriction-select`
++      );
++      expect(select).toBeTruthy();
++      expect([...select.options].map((o) => o.value)).toEqual([
++        "strip",
++        "friction",
++        "block",
++      ]);
++      expect([...select.options].map((o) => o.textContent)).toEqual([
++        "Strip",
++        "Friction",
++        "Block",
++      ]);
++      expect(select.value).toBe(level);
++      expect(select.getAttribute("aria-label")).toBe(`Restriction level for ${domain}`);
++    }
++  });
+ 
+-    // Twitter should show "block" as selected
+-    const twitterModeValue = twitterModeToggle.querySelector('.mode-value');
+-    expect(twitterModeValue.textContent).toBe("block");
++  it("defaults the dropdown to Strip for sites without a restrictionLevel", async () => {
++    await mountPopup({
++      enabled: true,
++      sites: [{ domain: "reddit.com", active: true }],
++    });
++    const select = document.querySelector(
++      '.site-card[data-domain="reddit.com"] .restriction-select'
++    );
++    expect(select.value).toBe("strip");
+   });
+ 
+-  it("toggling intervention mode updates storage", async () => {
++  it("selecting each level persists restrictionLevel; friction also persists frictionDelay: 15", async () => {
+     await mountPopup({
+       enabled: true,
+-      sites: [
+-        { domain: "youtube.com", active: true, interventionMode: "strip" },
+-      ],
++      sites: [{ domain: "youtube.com", active: true, restrictionLevel: "strip" }],
+     });
+ 
+-    const youtubeCard = document.querySelector('.site-card[data-domain="youtube.com"]');
+-    const modeToggle = youtubeCard.querySelector('.intervention-mode-toggle');
+-    const modeButton = modeToggle.querySelector('.mode-button');
++    let site = await selectLevel("youtube.com", "friction");
++    expect(site.restrictionLevel).toBe("friction");
++    expect(site.frictionDelay).toBe(15);
+ 
+-    // Click to toggle from strip to block
+-    modeButton.click();
+-    await flushMicrotasks();
++    site = await selectLevel("youtube.com", "block");
++    expect(site.restrictionLevel).toBe("block");
++    expect(site.frictionDelay).toBeUndefined();
+ 
+-    const data = await chrome.storage.sync.get(["sites"]);
+-    const youtubeSite = data.sites.find((s) => s.domain === "youtube.com");
+-    expect(youtubeSite.interventionMode).toBe("block");
++    site = await selectLevel("youtube.com", "strip");
++    expect(site.restrictionLevel).toBe("strip");
++    expect(site.frictionDelay).toBeUndefined();
+   });
+ 
+-  it("shows element-level toggles for YouTube in strip mode", async () => {
++  it("friction shows the static 'Delay: 15 seconds' note; strip shows element checkboxes; block shows neither", async () => {
+     await mountPopup({
+       enabled: true,
+-      sites: [
+-        { domain: "youtube.com", active: true, interventionMode: "strip" },
+-      ],
++      sites: [{ domain: "youtube.com", active: true, restrictionLevel: "friction", frictionDelay: 15 }],
+     });
+ 
+-    const youtubeCard = document.querySelector('.site-card[data-domain="youtube.com"]');
+-    const elementToggles = youtubeCard.querySelector('.element-toggles');
+-
+-    // YouTube should show element-level toggles
++    let card = document.querySelector('.site-card[data-domain="youtube.com"]');
++    expect(card.querySelector(".friction-delay-note").textContent).toBe("Delay: 15 seconds");
++    expect(card.querySelector(".element-toggles")).toBeNull();
++    // The old [5,30,60] delay selector is gone entirely.
++    expect(card.querySelector(".friction-level-select")).toBeNull();
++
++    // Strip → element checkboxes appear, delay note disappears.
++    await selectLevel("youtube.com", "strip");
++    card = document.querySelector('.site-card[data-domain="youtube.com"]');
++    expect(card.querySelector(".friction-delay-note")).toBeNull();
++    const elementToggles = card.querySelector(".element-toggles");
+     expect(elementToggles).toBeTruthy();
++    expect(elementToggles.querySelector('[data-element="homeFeed"]')).toBeTruthy();
++    expect(elementToggles.querySelector('[data-element="sidebar"]')).toBeTruthy();
++    expect(elementToggles.querySelector('[data-element="shorts"]')).toBeTruthy();
++    expect(elementToggles.querySelector('[data-element="comments"]')).toBeTruthy();
+ 
+-    // Should have toggles for key elements
+-    const homeFeedToggle = elementToggles.querySelector('[data-element="homeFeed"]');
+-    const sidebarToggle = elementToggles.querySelector('[data-element="sidebar"]');
+-    const shortsToggle = elementToggles.querySelector('[data-element="shorts"]');
+-    const commentsToggle = elementToggles.querySelector('[data-element="comments"]');
+-
+-    expect(homeFeedToggle).toBeTruthy();
+-    expect(sidebarToggle).toBeTruthy();
+-    expect(shortsToggle).toBeTruthy();
+-    expect(commentsToggle).toBeTruthy();
++    // Block → neither delay note nor element toggles.
++    await selectLevel("youtube.com", "block");
++    card = document.querySelector('.site-card[data-domain="youtube.com"]');
++    expect(card.querySelector(".friction-delay-note")).toBeNull();
++    expect(card.querySelector(".element-toggles")).toBeNull();
+   });
+ 
+-  it("hides element-level toggles for unsupported platforms", async () => {
++  it("hides element toggles for unsupported platforms even in strip mode", async () => {
+     await mountPopup({
+       enabled: true,
+-      sites: [
+-        { domain: "twitter.com", active: true, interventionMode: "strip" },
+-      ],
++      sites: [{ domain: "twitter.com", active: true, restrictionLevel: "strip" }],
+     });
+ 
+     const twitterCard = document.querySelector('.site-card[data-domain="twitter.com"]');
+-    const elementToggles = twitterCard.querySelector('.element-toggles');
++    expect(twitterCard.querySelector(".element-toggles")).toBeNull();
++  });
++
++  it("never reads or writes the legacy interventionMode/frictionLevel keys", async () => {
++    await mountPopup({
++      enabled: true,
++      sites: [{ domain: "youtube.com", active: true, restrictionLevel: "strip" }],
++    });
++
++    const setCallsBefore = chrome.storage.sync.set.mock.calls.length;
++    await selectLevel("youtube.com", "friction");
++    await selectLevel("youtube.com", "block");
++
++    // Every sync write since mount carries restrictionLevel-bearing sites
++    // with no legacy keys anywhere inside them.
++    const writes = chrome.storage.sync.set.mock.calls.slice(setCallsBefore);
++    expect(writes.length).toBeGreaterThan(0);
++    for (const [items] of writes) {
++      if (!items.sites) continue;
++      for (const site of items.sites) {
++        expect(Object.keys(site)).toContain("restrictionLevel");
++        expect(Object.keys(site)).not.toContain("interventionMode");
++        expect(Object.keys(site)).not.toContain("frictionLevel");
++      }
++    }
+ 
+-    // Twitter doesn't have a stripping template yet, so no element toggles
+-    expect(elementToggles).toBeNull();
++    const data = await chrome.storage.sync.get(["sites"]);
++    const site = data.sites.find((s) => s.domain === "youtube.com");
++    expect(site.restrictionLevel).toBe("block");
++    expect(Object.keys(site)).not.toContain("interventionMode");
++    expect(Object.keys(site)).not.toContain("frictionLevel");
+   });
+ });
+ 
+@@ -341,6 +399,300 @@ function readPopupFlipDigits() {
+   return `${digits[0]}${digits[1]}:${digits[2]}${digits[3]}`;
+ }
+ 
++describe("popup.js — Lock Down panel (#25)", () => {
++  beforeEach(() => {
++    ensureLocalStorage();
++  });
++
++  afterEach(() => {
++    vi.useRealTimers();
++    window.localStorage.clear();
++  });
++
++  it("is collapsed by default and sits at the top of the Blocklist tab", async () => {
++    await mountPopup({ enabled: true, sites: [] });
++
++    const toggle = document.getElementById("lockdown-toggle");
++    expect(toggle.getAttribute("aria-expanded")).toBe("false");
++    expect(document.getElementById("lockdown-panel").classList.contains("open")).toBe(false);
++
++    // First section inside the Blocklist panel, before the add-site section.
++    const firstSection = document.querySelector("#tab-panel-sites > section");
++    expect(firstSection.classList.contains("lockdown-section")).toBe(true);
++    expect(firstSection.nextElementSibling.classList.contains("add-site-section")).toBe(true);
++  });
++
++  it("expanding reveals the duration select (15/25/45/60) and START; idle state hides the countdown", async () => {
++    await mountPopup({ enabled: true, sites: [] });
++
++    const toggle = document.getElementById("lockdown-toggle");
++    toggle.click();
++    expect(toggle.getAttribute("aria-expanded")).toBe("true");
++    expect(document.getElementById("lockdown-panel").classList.contains("open")).toBe(true);
++
++    const select = document.getElementById("lockdown-duration");
++    expect([...select.options].map((o) => o.value)).toEqual(["15", "25", "45", "60"]);
++    expect(select.getAttribute("aria-label")).toBe("Lock Down duration");
++    expect(document.getElementById("lockdown-idle").hidden).toBe(false);
++    expect(document.getElementById("lockdown-active").hidden).toBe(true);
++
++    // Collapsing again closes the panel.
++    toggle.click();
++    expect(toggle.getAttribute("aria-expanded")).toBe("false");
++    expect(document.getElementById("lockdown-panel").classList.contains("open")).toBe(false);
++  });
++
++  it("START writes focusSessionActive and a future focusSessionEndsAt to storage.local, then shows the active panel", async () => {
++    await mountPopup({ enabled: true, sites: [] });
++
++    document.getElementById("lockdown-toggle").click();
++    document.getElementById("lockdown-duration").value = "45";
++
++    const before = Date.now();
++    document.getElementById("lockdown-start-btn").click();
++    await flushMicrotasks();
++
++    const data = await chrome.storage.local.get(["focusSessionActive", "focusSessionEndsAt"]);
++    expect(data.focusSessionActive).toBe(true);
++    expect(typeof data.focusSessionEndsAt).toBe("number");
++    expect(data.focusSessionEndsAt).toBeGreaterThanOrEqual(before + 45 * 60000);
++    expect(data.focusSessionEndsAt).toBeLessThanOrEqual(Date.now() + 45 * 60000);
++
++    // Panel flipped to the active state.
++    expect(document.getElementById("lockdown-idle").hidden).toBe(true);
++    expect(document.getElementById("lockdown-active").hidden).toBe(false);
++  });
++
++  it("active panel shows a live countdown ticking each second, the Block-mode note, and STOP", async () => {
++    await mountPopup({ enabled: true, sites: [] });
++
++    vi.useFakeTimers();
++    const now = Date.now();
++    await chrome.storage.local.set({
++      focusSessionActive: true,
++      focusSessionEndsAt: now + 65_000,
++    });
++    await flushMicrotasks();
++
++    const countdown = document.getElementById("lockdown-countdown");
++    expect(countdown.textContent).toBe("01:05");
++    expect(countdown.getAttribute("aria-label")).toContain("01:05");
++    expect(document.querySelector("#lockdown-active .lockdown-note").textContent).toBe(
++      "All sites → Block mode"
++    );
++    expect(document.getElementById("lockdown-stop-btn")).toBeTruthy();
++
++    // The 1s ticker repaints from the deadline.
++    await vi.advanceTimersByTimeAsync(1000);
++    expect(countdown.textContent).toBe("01:04");
++
++    await vi.advanceTimersByTimeAsync(2000);
++    expect(countdown.textContent).toBe("01:02");
++
++    // The header chip mirrors the countdown even while collapsed.
++    const headerStatus = document.getElementById("lockdown-header-status");
++    expect(headerStatus.hidden).toBe(false);
++    expect(headerStatus.textContent).toBe("01:02");
++  });
++
++  it("STOP removes both session keys from storage.local and returns the panel to idle", async () => {
++    await mountPopup(
++      { enabled: true, sites: [] },
++      { focusSessionActive: true, focusSessionEndsAt: Date.now() + 300_000 }
++    );
++
++    // Seeded active session is adopted on open.
++    expect(document.getElementById("lockdown-active").hidden).toBe(false);
++    expect(document.getElementById("lockdown-idle").hidden).toBe(true);
++
++    document.getElementById("lockdown-stop-btn").click();
++    await flushMicrotasks();
++
++    const data = await chrome.storage.local.get(["focusSessionActive", "focusSessionEndsAt"]);
++    expect(data.focusSessionActive).toBeUndefined();
++    expect(data.focusSessionEndsAt).toBeUndefined();
++
++    expect(document.getElementById("lockdown-idle").hidden).toBe(false);
++    expect(document.getElementById("lockdown-active").hidden).toBe(true);
++    expect(document.getElementById("lockdown-header-status").hidden).toBe(true);
++  });
++
++  it("reacts to external storage.local writes (start, then background-style clear)", async () => {
++    await mountPopup({ enabled: true, sites: [] });
++    expect(document.getElementById("lockdown-idle").hidden).toBe(false);
++
++    vi.useFakeTimers();
++    const now = Date.now();
++
++    // External start (e.g. another surface arms the session).
++    await chrome.storage.local.set({
++      focusSessionActive: true,
++      focusSessionEndsAt: now + 125_000,
++    });
++    await flushMicrotasks();
++    expect(document.getElementById("lockdown-active").hidden).toBe(false);
++    expect(document.getElementById("lockdown-countdown").textContent).toBe("02:05");
++
++    // External clear — the background worker's expiry rewrite shape.
++    await chrome.storage.local.set({ focusSessionActive: false, focusSessionEndsAt: null });
++    await flushMicrotasks();
++    expect(document.getElementById("lockdown-active").hidden).toBe(true);
++    expect(document.getElementById("lockdown-idle").hidden).toBe(false);
++  });
++
++  it("never reads the inert storage.sync copies of the session keys", async () => {
++    await mountPopup(
++      { enabled: true, sites: [], focusSessionActive: true, focusSessionEndsAt: Date.now() + 60000 },
++      {}
++    );
++
++    // Only the local-area keys are authoritative — sync copies are ignored.
++    expect(document.getElementById("lockdown-active").hidden).toBe(true);
++    expect(document.getElementById("lockdown-idle").hidden).toBe(false);
++  });
++});
++
++describe("popup.js — Lock Down disabled site cards (#26)", () => {
++  beforeEach(() => {
++    ensureLocalStorage();
++  });
++
++  afterEach(() => {
++    vi.useRealTimers();
++    window.localStorage.clear();
++  });
++
++  // Mixed list: both built-ins (one strip → has element toggles, one
++  // friction) plus a user-added site, covering every card variant.
++  const MIXED_SITES = [
++    { domain: "youtube.com", active: true, restrictionLevel: "strip" },
++    { domain: "facebook.com", active: true, restrictionLevel: "friction", frictionDelay: 15 },
++    { domain: "twitter.com", active: true, restrictionLevel: "block" },
++  ];
++
++  function cards() {
++    return [...document.querySelectorAll(".site-card")];
++  }
++
++  function expectCardsLocked() {
++    const all = cards();
++    expect(all.length).toBe(MIXED_SITES.length);
++    for (const card of all) {
++      expect(card.classList.contains("lockdown")).toBe(true);
++      const badge = card.querySelector(".lockdown-badge");
++      expect(badge).toBeTruthy();
++      expect(badge.textContent).toContain("Lock Down");
++      expect(card.querySelector(".restriction-select").disabled).toBe(true);
++      expect(card.querySelector(".site-toggle input").disabled).toBe(true);
++    }
++    // Element checkboxes (strip-mode built-in) are disabled too.
++    const elementCheckboxes = document.querySelectorAll(
++      '.site-card[data-domain="youtube.com"] .element-toggle input'
++    );
++    expect(elementCheckboxes.length).toBeGreaterThan(0);
++    elementCheckboxes.forEach((cb) => expect(cb.disabled).toBe(true));
++    // User-site delete button is inert as well.
++    expect(
++      document.querySelector('.site-card[data-domain="twitter.com"] .btn-delete').disabled
++    ).toBe(true);
++    // The master toggle MUST stay functional during Lock Down.
++    expect(document.getElementById("master-toggle-input").disabled).toBe(false);
++  }
++
++  function expectCardsInteractive() {
++    const all = cards();
++    expect(all.length).toBe(MIXED_SITES.length);
++    for (const card of all) {
++      expect(card.classList.contains("lockdown")).toBe(false);
++      expect(card.querySelector(".lockdown-badge")).toBeNull();
++      expect(card.querySelector(".restriction-select").disabled).toBe(false);
++      expect(card.querySelector(".site-toggle input").disabled).toBe(false);
++    }
++    document
++      .querySelectorAll('.site-card[data-domain="youtube.com"] .element-toggle input')
++      .forEach((cb) => expect(cb.disabled).toBe(false));
++    expect(
++      document.querySelector('.site-card[data-domain="twitter.com"] .btn-delete').disabled
++    ).toBe(false);
++    expect(document.getElementById("master-toggle-input").disabled).toBe(false);
++  }
++
++  it("with an active session, built-in and user cards show the lock badge and all per-site controls are disabled; master toggle stays enabled", async () => {
++    await mountPopup(
++      { enabled: true, sites: MIXED_SITES },
++      { focusSessionActive: true, focusSessionEndsAt: Date.now() + 300_000 }
++    );
++
++    expectCardsLocked();
++  });
++
++  it("without an active session (flag absent), every card is fully interactive with no lock badge", async () => {
++    await mountPopup({ enabled: true, sites: MIXED_SITES });
++
++    expectCardsInteractive();
++  });
++
++  it("with focusSessionActive false in storage.local, cards remain fully interactive", async () => {
++    await mountPopup(
++      { enabled: true, sites: MIXED_SITES },
++      { focusSessionActive: false, focusSessionEndsAt: null }
++    );
++
++    expectCardsInteractive();
++  });
++
++  it("reacts live to storage.local onChanged: an external start locks the cards, an external clear unlocks them — no reload", async () => {
++    await mountPopup({ enabled: true, sites: MIXED_SITES });
++    expectCardsInteractive();
++
++    // External start (e.g. another surface arms the session).
++    await chrome.storage.local.set({
++      focusSessionActive: true,
++      focusSessionEndsAt: Date.now() + 125_000,
++    });
++    await flushMicrotasks();
++    expectCardsLocked();
++
++    // External clear — the background worker's expiry rewrite shape.
++    await chrome.storage.local.set({ focusSessionActive: false, focusSessionEndsAt: null });
++    await flushMicrotasks();
++    expectCardsInteractive();
++  });
++
++  it("STOP restores fully interactive cards immediately", async () => {
++    await mountPopup(
++      { enabled: true, sites: MIXED_SITES },
++      { focusSessionActive: true, focusSessionEndsAt: Date.now() + 300_000 }
++    );
++    expectCardsLocked();
++
++    document.getElementById("lockdown-stop-btn").click();
++    await flushMicrotasks();
++    expectCardsInteractive();
++  });
++
++  it("cards added or re-rendered mid-session are locked from the moment they appear", async () => {
++    await mountPopup(
++      { enabled: true, sites: MIXED_SITES },
++      { focusSessionActive: true, focusSessionEndsAt: Date.now() + 300_000 }
++    );
++
++    // External sites write re-renders the whole card list mid-session.
++    const nextSites = [...MIXED_SITES, { domain: "reddit.com", active: true }];
++    await chrome.storage.sync.set({ sites: nextSites });
++    await flushMicrotasks();
++
++    const redditCard = document.querySelector('.site-card[data-domain="reddit.com"]');
++    expect(redditCard).toBeTruthy();
++    expect(redditCard.classList.contains("lockdown")).toBe(true);
++    expect(redditCard.querySelector(".lockdown-badge")).toBeTruthy();
++    expect(redditCard.querySelector(".restriction-select").disabled).toBe(true);
++    expect(redditCard.querySelector(".site-toggle input").disabled).toBe(true);
++    // Master toggle still functional.
++    expect(document.getElementById("master-toggle-input").disabled).toBe(false);
++  });
++});
++
+ describe("popup.js — tabs", () => {
+   beforeEach(() => {
+     ensureLocalStorage();
+diff --git a/vitest.config.js b/vitest.config.js
+index c74832d..96e4ae4 100644
+--- a/vitest.config.js
++++ b/vitest.config.js
+@@ -9,6 +9,11 @@ export default defineConfig({
+     // switching avoids the whole class of problem.
+     pool: "threads",
+     environment: "jsdom",
++    // jsdom-based suites are CPU-bound and this machine runs all files in
++    // parallel, so the 5s default occasionally times out healthy tests under
++    // peak load (observed flakes in popup/blocked suites). 15s keeps a real
++    // hang fast-failing while absorbing load spikes.
++    testTimeout: 15000,
+     include: ["tests/**/*.test.js"],
+     // A later agent may add Playwright specs under tests/e2e/ — those are
+     // driven by `playwright test`, not vitest, and must never be collected
