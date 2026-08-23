@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PROTOTYPE — MindfulBrowse Interstitial</title>
+  <link rel="stylesheet" href="../shared/theme.css">
+  <link rel="stylesheet" href="../fonts/fonts.css">
+  <style>
+    /* ═══════════════════════════════════════════════════
+       PROTOTYPE — throwaway, do not ship
+       Switch variants: ?v=1 (circle), ?v=2 (ring), ?v=3 (minimal)
+       ══════════════════════════════════════════════════ */
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: var(--font-body);
+      background: var(--bg-dark);
+      color: var(--text-primary);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+    }
+
+    /* ── Variant switcher (prototype only) ──────────── */
+    .variant-bar {
+      position: fixed;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      display: flex;
+      gap: 8px;
+      padding: 12px;
+      background: var(--surface);
+      border-top: 1px solid var(--hairline);
+      z-index: 1000;
+      justify-content: center;
+    }
+    .variant-bar button {
+      padding: 6px 16px;
+      background: var(--bg-card);
+      border: 1px solid var(--hairline);
+      border-radius: var(--radius-sm);
+      color: var(--text-secondary);
+      font-size: var(--text-sm);
+      cursor: pointer;
+    }
+    .variant-bar button.active {
+      background: var(--work-color);
+      color: var(--bg-dark);
+      border-color: var(--work-color);
+    }
+
+    /* ── Shared layout ──────────────────────────────── */
+    .interstitial {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: var(--space-5);
+      padding: var(--space-6);
+      max-width: 420px;
+      width: 100%;
+    }
+
+    .message {
+      text-align: center;
+    }
+    .message h1 {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--text-primary);
+      margin-bottom: var(--space-2);
+    }
+    .message p {
+      font-size: var(--text-sm);
+      color: var(--text-secondary);
+      line-height: 1.5;
+    }
+    .message .domain {
+      color: var(--work-color);
+      font-weight: 600;
+    }
+
+    .countdown {
+      font-family: var(--font-display);
+      font-size: 36px;
+      color: var(--text-primary);
+      letter-spacing: 2px;
+    }
+
+    .btn-proceed {
+      padding: 12px 32px;
+      border: none;
+      border-radius: var(--radius-md);
+      font-family: var(--font-body);
+      font-size: var(--text-md);
+      font-weight: 600;
+      cursor: pointer;
+      transition: all var(--transition);
+    }
+    .btn-proceed:disabled {
+      background: var(--bg-card);
+      color: var(--text-muted);
+      cursor: not-allowed;
+    }
+    .btn-proceed:not(:disabled) {
+      background: var(--work-color);
+      color: var(--bg-dark);
+    }
+    .btn-proceed:not(:disabled):hover {
+      background: #3ee883;
+      transform: scale(1.02);
+    }
+
+    /* ═══════════════════════════════════════════════════
+       VARIANT 1: Expanding circle (default)
+       ═══════════════════════════════════════════════════ */
+    .v1 .breathing-circle {
+      width: 120px;
+      height: 120px;
+      border-radius: 50%;
+      background: var(--work-color);
+      opacity: 0.15;
+      animation: breathe-v1 4s ease-in-out infinite;
+    }
+    @keyframes breathe-v1 {
+      0%, 100% { transform: scale(0.8); opacity: 0.1; }
+      50% { transform: scale(1.2); opacity: 0.25; }
+    }
+
+    /* ═══════════════════════════════════════════════════
+       VARIANT 2: Pulsing ring
+       ═══════════════════════════════════════════════════ */
+    .v2 .breathing-ring {
+      width: 120px;
+      height: 120px;
+      border-radius: 50%;
+      border: 3px solid var(--work-color);
+      opacity: 0.4;
+      animation: breathe-v2 4s ease-in-out infinite;
+    }
+    @keyframes breathe-v2 {
+      0%, 100% { transform: scale(0.9); opacity: 0.3; }
+      50% { transform: scale(1.15); opacity: 0.6; }
+    }
+
+    /* ═══════════════════════════════════════════════════
+       VARIANT 3: Minimal — just text + countdown
+       ═══════════════════════════════════════════════════ */
+    .v3 .breathing-minimal {
+      font-size: var(--text-sm);
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 3px;
+      animation: breathe-v3 4s ease-in-out infinite;
+    }
+    @keyframes breathe-v3 {
+      0%, 100% { opacity: 0.4; }
+      50% { opacity: 1; }
+    }
+  </style>
+</head>
+<body class="v2">
+
+  <div class="interstitial">
+    <div class="breathing-circle"></div>
+
+    <div class="message">
+      <h1>Take a deep breath</h1>
+      <p>You're about to visit <span class="domain" id="target-domain">youtube.com</span></p>
+    </div>
+
+    <div class="countdown" id="countdown">0:10</div>
+
+    <button class="btn-proceed" id="btn-proceed" disabled>
+      I still want to go
+    </button>
+  </div>
+
+  <!-- Prototype variant switcher -->
+  <div class="variant-bar">
+    <button data-v="1" class="active">Circle</button>
+    <button data-v="2">Ring</button>
+    <button data-v="3">Minimal</button>
+  </div>
+
+  <script>
+    // ══════════════════════════════════════════════════
+    // PROTOTYPE LOGIC — throwaway
+    // ═══════════════════════════════════════════════════
+
+    const DELAY = 3; // seconds (default for strip mode)
+    let remaining = DELAY;
+
+    const countdownEl = document.getElementById('countdown');
+    const btnProceed = document.getElementById('btn-proceed');
+    const domainEl = document.getElementById('target-domain');
+
+    // Read target domain from URL param
+    const params = new URLSearchParams(window.location.search);
+    const target = params.get('target') || 'youtube.com';
+    domainEl.textContent = target;
+
+    // Countdown
+    function updateCountdown() {
+      const mins = Math.floor(remaining / 60);
+      const secs = remaining % 60;
+      countdownEl.textContent = `${mins}:${secs.toString().padStart(2, '0')}`;
+
+      if (remaining <= 0) {
+        btnProceed.disabled = false;
+        countdownEl.style.color = 'var(--work-color)';
+      } else {
+        remaining--;
+      }
+    }
+
+    updateCountdown();
+    const timer = setInterval(updateCountdown, 1000);
+
+    // Proceed button
+    btnProceed.addEventListener('click', () => {
+      clearInterval(timer);
+      // In production: remove overlay, let stripping CSS take effect
+      document.body.style.opacity = '0';
+      document.body.style.transition = 'opacity 0.5s';
+      setTimeout(() => {
+        alert('PROTOTYPE: overlay removed, stripping active\n\nIn production, this would fade out and the page would load with distracting elements hidden.');
+        document.body.style.opacity = '1';
+      }, 500);
+    });
+
+    // Variant switcher
+    const variantBtns = document.querySelectorAll('.variant-bar button');
+    variantBtns.forEach(btn => {
+      btn.addEventListener('click', () => {
+        const v = btn.dataset.v;
+        document.body.className = `v${v}`;
+
+        // Swap breathing element
+        const interstitial = document.querySelector('.interstitial');
+        const oldBreathing = interstitial.querySelector('[class^="breathing-"]');
+        if (oldBreathing) oldBreathing.remove();
+
+        let newEl;
+        if (v === '1') {
+          newEl = document.createElement('div');
+          newEl.className = 'breathing-circle';
+        } else if (v === '2') {
+          newEl = document.createElement('div');
+          newEl.className = 'breathing-ring';
+        } else if (v === '3') {
+          newEl = document.createElement('div');
+          newEl.className = 'breathing-minimal';
+          newEl.textContent = 'Breathe';
+        }
+        interstitial.insertBefore(newEl, interstitial.firstChild);
+
+        // Update active button
+        variantBtns.forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+
+        // Update URL
+        window.history.replaceState(null, '', `?v=${v}&target=${encodeURIComponent(target)}`);
+      });
+    });
+
+    // Read initial variant from URL
+    const initialV = params.get('v') || '1';
+    document.querySelector(`.variant-bar button[data-v="${initialV}"]`)?.click();
+  </script>
+
+</body>
+</html>
